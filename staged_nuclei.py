@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Staged Nuclei Scanner with Technology Detection
+Staged Nuclei Scanner for Nmap Output
 
-A smart, multi-stage vulnerability scanner that:
-1. Discovers live HTTP/HTTPS services
-2. Takes screenshots for visual reconnaissance
-3. Detects technologies (CMS, frameworks, servers)
-4. Runs targeted scans based on detected tech
-5. Performs deep vulnerability enumeration
+A service-aware vulnerability scanner that seamlessly continues from staged_nmap.py:
+1. Parses Nmap scan results (XML from 03_enum/)
+2. Categorizes services (web, database, network, iot, devops)
+3. Builds appropriate targets per service type
+4. Runs targeted Nuclei scans based on detected services
+5. Segregates results by service category within the same output directory
 
-Designed for efficient large-scale web application reconnaissance.
+Results are placed in the nmap output directory (04_db/, 05_network/, 06_web/, etc.)
 """
 
 import argparse
@@ -18,10 +18,12 @@ import os
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 import logging
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -32,480 +34,358 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Technology to template tag mapping
-TECH_TEMPLATE_MAP = {
-    # CMS
-    'wordpress': ['wordpress'],
-    'drupal': ['drupal'],
-    'joomla': ['joomla'],
-    'magento': ['magento'],
-    'shopify': ['shopify'],
-    'prestashop': ['prestashop'],
-    'opencart': ['opencart'],
-    
-    # Frameworks
-    'django': ['django'],
-    'laravel': ['laravel', 'php'],
-    'spring': ['spring', 'java'],
-    'express': ['express', 'nodejs'],
-    'flask': ['flask', 'python'],
-    'rails': ['rails', 'ruby'],
-    'asp.net': ['asp', 'microsoft'],
-    
-    # Servers
-    'apache': ['apache'],
-    'nginx': ['nginx'],
-    'iis': ['iis', 'microsoft'],
-    'tomcat': ['tomcat', 'java'],
-    'jetty': ['jetty', 'java'],
-    'websphere': ['websphere', 'ibm'],
-    'weblogic': ['weblogic', 'oracle'],
-    
-    # Platforms
-    'jenkins': ['jenkins', 'ci'],
-    'gitlab': ['gitlab'],
-    'github': ['github'],
-    'bitbucket': ['bitbucket'],
-    'docker': ['docker'],
-    'kubernetes': ['kubernetes', 'k8s'],
-    'grafana': ['grafana'],
-    'kibana': ['kibana', 'elastic'],
-    'sonarqube': ['sonarqube'],
-    
-    # Databases/Admin
-    'phpmyadmin': ['phpmyadmin', 'php'],
-    'adminer': ['adminer', 'php'],
-    'mongodb': ['mongodb'],
-    'elasticsearch': ['elasticsearch', 'elastic'],
-    
-    # Other
-    'coldfusion': ['coldfusion', 'adobe'],
-    'sharepoint': ['sharepoint', 'microsoft'],
-    'confluence': ['confluence', 'atlassian'],
-    'jira': ['jira', 'atlassian'],
+# Service categorization based on port and service name
+SERVICE_CATEGORIES = {
+    'web': {
+        'ports': [80, 443, 8000, 8080, 8443, 8888, 3000, 5000, 9000],
+        'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt'],
+        'templates': ['http/exposures/', 'http/cves/', 'http/vulnerabilities/', 
+                     'http/misconfiguration/', 'http/default-logins/', 'http/token-spray/']
+    },
+    'database': {
+        'ports': [3306, 5432, 1433, 1521, 27017, 6379, 9042, 5984, 9200],
+        'services': ['mysql', 'postgresql', 'ms-sql', 'oracle', 'mongodb', 
+                    'redis', 'cassandra', 'couchdb', 'elasticsearch'],
+        'templates': ['network/exposures/', 'network/cves/', 'network/vulnerabilities/']
+    },
+    'network': {
+        'ports': [21, 22, 23, 25, 53, 110, 143, 161, 389, 445, 548, 636, 
+                 873, 1099, 2049, 3389, 5900, 5985, 5986],
+        'services': ['ftp', 'ssh', 'telnet', 'smtp', 'dns', 'pop3', 'imap', 
+                    'snmp', 'ldap', 'microsoft-ds', 'smb', 'afp', 'ldaps',
+                    'rsync', 'rmi', 'nfs', 'ms-wbt-server', 'rdp', 'vnc', 
+                    'winrm', 'wsman'],
+        'templates': ['network/exposures/', 'network/cves/', 'network/detection/']
+    },
+    'iot': {
+        'ports': [1883, 8883, 5683, 502, 20000],
+        'services': ['mqtt', 'mqtts', 'coap', 'modbus', 'dnp3'],
+        'templates': ['iot/']
+    },
+    'devops': {
+        'ports': [2375, 2376, 6443, 9418, 50000],
+        'services': ['docker', 'kubernetes', 'k8s', 'git', 'jenkins'],
+        'templates': ['exposures/', 'misconfiguration/', 'cves/']
+    }
 }
 
-# Default important templates to always run
-DEFAULT_TEMPLATES = [
-    'http/cves/',
-    'http/exposures/',
-    'http/misconfiguration/',
-    'http/vulnerabilities/',
-    'http/default-logins/',
-]
-
-# Severity-based template groups
-SEVERITY_TEMPLATES = {
-    'critical': ['http/cves/', 'http/vulnerabilities/'],
-    'high': ['http/cves/', 'http/vulnerabilities/', 'http/exposures/'],
-    'medium': ['http/cves/', 'http/vulnerabilities/', 'http/exposures/', 'http/misconfiguration/'],
-    'all': DEFAULT_TEMPLATES + ['http/fuzzing/', 'http/token-spray/']
+# Port-specific Nuclei templates
+PORT_TEMPLATE_MAP = {
+    # Web servers
+    80: 'http',
+    443: 'ssl',
+    8080: 'http',
+    8443: 'ssl',
+    8000: 'http',
+    8888: 'http',
+    
+    # Databases
+    3306: 'mysql',
+    5432: 'postgresql',
+    27017: 'mongodb',
+    6379: 'redis',
+    9200: 'elasticsearch',
+    
+    # Network services
+    21: 'ftp',
+    22: 'ssh',
+    23: 'telnet',
+    445: 'smb',
+    3389: 'rdp',
+    5900: 'vnc',
 }
 
 
-class StagedNucleiScanner:
+class NmapNucleiScanner:
+    """Scanner that processes Nmap output and runs targeted Nuclei scans"""
+    
     def __init__(self, args):
         self.args = args
-        self.output_dir = Path(args.output)
-        self.targets = []
-        self.live_targets = []
-        self.tech_detected = {}  # target -> [technologies]
-        self.scan_queue = {}  # target -> [template_tags]
+        self.nmap_dir = Path(args.nmap_output)
+        # Use nmap output directory as base for nuclei results (seamless continuation)
+        self.output_dir = self.nmap_dir
         
-        # Create output structure
+        # Service data structures
+        self.services = defaultdict(list)  # category -> [(ip, port, service, product)]
+        self.all_services = []  # all discovered services
+        
+        # Create output structure by service category within same directory
         self.dirs = {
             'base': self.output_dir,
-            'stage0': self.output_dir / '00_httpx',
-            'stage1': self.output_dir / '01_gowitness',
-            'stage2': self.output_dir / '02_tech_detect',
-            'stage3': self.output_dir / '03_targeted_scan',
-            'stage4': self.output_dir / '04_deep_enum',
+            '04_db': self.output_dir / '04_db',
+            '05_network': self.output_dir / '05_network',
+            '06_web': self.output_dir / '06_web',
+            '07_iot': self.output_dir / '07_iot',
+            '08_devops': self.output_dir / '08_devops',
+            '09_other': self.output_dir / '09_other',
         }
         
         for dir_path in self.dirs.values():
             dir_path.mkdir(parents=True, exist_ok=True)
     
     def check_requirements(self):
-        """Verify required tools are installed"""
-        required = ['httpx', 'gowitness', 'nuclei']
-        missing = []
+        """Verify required tools and files"""
+        # Check nuclei
+        if subprocess.run(['which', 'nuclei'], capture_output=True).returncode != 0:
+            logger.error("Missing nuclei. Install with: go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
+            sys.exit(1)
         
-        for tool in required:
-            if subprocess.run(['which', tool], capture_output=True).returncode != 0:
-                missing.append(tool)
+        # Check nmap output directory
+        if not self.nmap_dir.exists():
+            logger.error(f"Nmap output directory not found: {self.nmap_dir}")
+            sys.exit(1)
         
-        if missing:
-            logger.error(f"Missing required tools: {', '.join(missing)}")
-            logger.error("Install with: go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest")
-            logger.error("             go install -v github.com/sensepost/gowitness@latest")
-            logger.error("             go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
+        # Check for expected nmap output files
+        enum_dir = self.nmap_dir / '03_enum'
+        if not enum_dir.exists():
+            logger.error(f"Nmap enumeration directory not found: {enum_dir}")
+            logger.error("Expected directory structure from staged_nmap.py output")
             sys.exit(1)
         
         # Update nuclei templates
         logger.info("Updating Nuclei templates...")
         subprocess.run(['nuclei', '-ut'], capture_output=True)
     
-    def load_targets(self):
-        """Load targets from input file"""
-        logger.info(f"Loading targets from {self.args.input}")
+    def parse_nmap_xml(self, xml_path: Path) -> List[Dict]:
+        """Parse an Nmap XML file and extract service information"""
+        services = []
         
-        with open(self.args.input, 'r') as f:
-            for line in f:
-                target = line.strip()
-                if target and not target.startswith('#'):
-                    # Normalize targets
-                    if not target.startswith(('http://', 'https://')):
-                        # Add both http and https
-                        self.targets.append(f'http://{target}')
-                        self.targets.append(f'https://{target}')
-                    else:
-                        self.targets.append(target)
-        
-        logger.info(f"Loaded {len(self.targets)} targets (including http/https variants)")
-        
-        # Write targets file for tools
-        targets_file = self.output_dir / 'input_targets.txt'
-        with open(targets_file, 'w') as f:
-            f.write('\n'.join(self.targets))
-        
-        return targets_file
-    
-    def stage0_discovery(self, targets_file):
-        """Stage 0: Discover live HTTP/HTTPS services using httpx"""
-        logger.info("=" * 60)
-        logger.info("STAGE 0: HTTP/HTTPS Service Discovery")
-        logger.info("=" * 60)
-        
-        output_file = self.dirs['stage0'] / 'live_services.json'
-        log_file = self.dirs['stage0'] / 'httpx.log'
-        
-        cmd = [
-            'httpx',
-            '-l', str(targets_file),
-            '-o', str(self.dirs['stage0'] / 'live_services.txt'),
-            '-json',
-            '-o', str(output_file),
-            '-status-code',
-            '-title',
-            '-tech-detect',
-            '-server',
-            '-follow-redirects',
-            '-random-agent',
-            '-timeout', str(self.args.timeout),
-            '-threads', str(self.args.threads),
-            '-retries', str(self.args.retries),
-        ]
-        
-        if self.args.verbose:
-            cmd.append('-verbose')
-        
-        logger.info(f"Running: {' '.join(cmd)}")
-        
-        with open(log_file, 'w') as log:
-            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
-        
-        if result.returncode != 0:
-            logger.warning(f"httpx exited with code {result.returncode}")
-        
-        # Parse results
-        if output_file.exists():
-            with open(output_file, 'r') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line.strip())
-                        url = data.get('url', '')
-                        if url:
-                            self.live_targets.append(url)
-                            
-                            # Extract initial tech detection from httpx
-                            techs = data.get('tech', [])
-                            if techs:
-                                self.tech_detected[url] = [t.lower() for t in techs]
-                    except json.JSONDecodeError:
-                        continue
-        
-        logger.info(f"✓ Discovered {len(self.live_targets)} live services")
-        
-        # Write live targets
-        live_file = self.output_dir / 'live_targets.txt'
-        with open(live_file, 'w') as f:
-            f.write('\n'.join(self.live_targets))
-        
-        if not self.live_targets:
-            logger.error("No live targets found! Check your input and network connectivity.")
-            sys.exit(1)
-        
-        return live_file
-    
-    def stage1_screenshots(self, live_file):
-        """Stage 1: Take screenshots of all live services using gowitness"""
-        logger.info("=" * 60)
-        logger.info("STAGE 1: Visual Reconnaissance (Screenshots)")
-        logger.info("=" * 60)
-        
-        # Create gowitness database and screenshots directory
-        db_file = self.dirs['stage1'] / 'gowitness.sqlite3'
-        screenshots_dir = self.dirs['stage1'] / 'screenshots'
-        screenshots_dir.mkdir(exist_ok=True)
-        
-        log_file = self.dirs['stage1'] / 'gowitness.log'
-        
-        # Run gowitness
-        cmd = [
-            'gowitness',
-            'file',
-            '-f', str(live_file),
-            '--db-path', str(db_file),
-            '--screenshot-path', str(screenshots_dir),
-            '--threads', str(self.args.threads),
-            '--timeout', str(self.args.timeout),
-            '--delay', '0',
-            '--disable-logging',
-        ]
-        
-        logger.info(f"Taking screenshots of {len(self.live_targets)} services...")
-        logger.info(f"Screenshots will be saved to: {screenshots_dir}")
-        
-        with open(log_file, 'w') as log:
-            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
-        
-        if result.returncode != 0:
-            logger.warning(f"gowitness exited with code {result.returncode}")
-        
-        # Count screenshots taken
-        screenshot_count = len(list(screenshots_dir.glob('*.png')))
-        logger.info(f"✓ Captured {screenshot_count} screenshots")
-        
-        # Generate HTML report
-        logger.info("Generating screenshot gallery...")
-        report_file = self.dirs['stage1'] / 'report.html'
-        
-        report_cmd = [
-            'gowitness',
-            'report',
-            'generate',
-            '--db-path', str(db_file),
-            '--output', str(report_file),
-        ]
-        
-        subprocess.run(report_cmd, capture_output=True)
-        
-        if report_file.exists():
-            logger.info(f"✓ Screenshot gallery: {report_file}")
-            logger.info(f"   Open in browser: file://{report_file.absolute()}")
-        
-        # Create screenshot summary
-        summary_file = self.dirs['stage1'] / 'screenshot_summary.txt'
-        with open(summary_file, 'w') as f:
-            f.write("Screenshot Summary\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(f"Total Screenshots: {screenshot_count}\n")
-            f.write(f"Gallery Report: {report_file}\n\n")
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
             
-            # List all screenshots
-            f.write("Screenshots by Target:\n")
-            f.write("-" * 60 + "\n")
-            for screenshot in sorted(screenshots_dir.glob('*.png')):
-                f.write(f"{screenshot.name}\n")
+            for host in root.findall('host'):
+                # Get IP address
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is None:
+                    addr_elem = host.find("address[@addrtype='ipv6']")
+                if addr_elem is None:
+                    continue
+                
+                ip = addr_elem.get('addr')
+                
+                # Get ports
+                ports_elem = host.find('ports')
+                if ports_elem is None:
+                    continue
+                
+                for port in ports_elem.findall('port'):
+                    state = port.find('state')
+                    if state is None or state.get('state') not in ('open', 'open|filtered'):
+                        continue
+                    
+                    port_id = int(port.get('portid'))
+                    protocol = port.get('protocol', 'tcp')
+                    
+                    # Get service information
+                    service_elem = port.find('service')
+                    service_name = service_elem.get('name', 'unknown') if service_elem is not None else 'unknown'
+                    product = service_elem.get('product', '') if service_elem is not None else ''
+                    version = service_elem.get('version', '') if service_elem is not None else ''
+                    tunnel = service_elem.get('tunnel', '') if service_elem is not None else ''
+                    
+                    services.append({
+                        'ip': ip,
+                        'port': port_id,
+                        'protocol': protocol,
+                        'service': service_name,
+                        'product': product,
+                        'version': version,
+                        'tunnel': tunnel
+                    })
         
-        logger.info(f"✓ Screenshot summary: {summary_file}")
+        except ET.ParseError as e:
+            logger.warning(f"Failed to parse {xml_path}: {e}")
+        except Exception as e:
+            logger.warning(f"Error processing {xml_path}: {e}")
+        
+        return services
     
-    def stage2_tech_detection(self, live_file):
-        """Stage 2: Deep technology detection using Nuclei"""
+    def categorize_service(self, service: Dict) -> str:
+        """Determine the category for a service"""
+        port = service['port']
+        svc_name = service['service'].lower()
+        
+        # Check each category
+        for category, config in SERVICE_CATEGORIES.items():
+            if port in config['ports'] or any(s in svc_name for s in config['services']):
+                return category
+        
+        return 'other'
+    
+    def load_nmap_results(self):
+        """Parse all Nmap XML results and categorize services"""
         logger.info("=" * 60)
-        logger.info("STAGE 2: Technology Detection & Fingerprinting")
+        logger.info("STAGE 0: Parsing Nmap Results")
         logger.info("=" * 60)
         
-        output_file = self.dirs['stage2'] / 'tech_detect.json'
-        log_file = self.dirs['stage2'] / 'nuclei_tech.log'
+        enum_dir = self.nmap_dir / '03_enum'
+        xml_files = list(enum_dir.glob('*.xml'))
+        
+        logger.info(f"Found {len(xml_files)} Nmap XML files to parse")
+        
+        # Parse all XML files
+        for xml_file in xml_files:
+            services = self.parse_nmap_xml(xml_file)
+            self.all_services.extend(services)
+        
+        logger.info(f"✓ Discovered {len(self.all_services)} total services")
+        
+        # Categorize services
+        for service in self.all_services:
+            category = self.categorize_service(service)
+            self.services[category].append(service)
+        
+        # Print summary
+        logger.info("\nService Distribution:")
+        for category in sorted(self.services.keys()):
+            count = len(self.services[category])
+            logger.info(f"  {category:12} : {count:4} services")
+        
+        # Write service summary
+        summary_file = self.output_dir / 'service_summary.txt'
+        with open(summary_file, 'w') as f:
+            f.write("Service Discovery Summary\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for category in sorted(self.services.keys()):
+                f.write(f"\n{category.upper()}\n")
+                f.write("-" * 80 + "\n")
+                for svc in self.services[category]:
+                    f.write(f"{svc['ip']:15} {svc['port']:5} {svc['service']:20} "
+                           f"{svc['product']} {svc['version']}\n")
+        
+        logger.info(f"✓ Service summary: {summary_file}\n")
+    
+    def build_target_lists(self):
+        """Build target lists for each service category"""
+        logger.info("=" * 60)
+        logger.info("STAGE 1: Building Target Lists")
+        logger.info("=" * 60)
+        
+        target_files = {}
+        
+        for category, services_list in self.services.items():
+            if not services_list:
+                continue
+            
+            # Determine output directory
+            if category == 'web':
+                out_dir = self.dirs['06_web']
+            elif category == 'database':
+                out_dir = self.dirs['04_db']
+            elif category == 'network':
+                out_dir = self.dirs['05_network']
+            elif category == 'iot':
+                out_dir = self.dirs['07_iot']
+            elif category == 'devops':
+                out_dir = self.dirs['08_devops']
+            else:
+                out_dir = self.dirs['09_other']
+            
+            # Build targets
+            targets = []
+            for svc in services_list:
+                ip = svc['ip']
+                port = svc['port']
+                service = svc['service']
+                tunnel = svc.get('tunnel', '')
+                
+                # Build appropriate target format
+                if category == 'web' or 'http' in service.lower():
+                    # Build HTTP/HTTPS URLs
+                    if port == 443 or tunnel == 'ssl' or 'https' in service.lower():
+                        targets.append(f"https://{ip}:{port}")
+                    elif port == 80:
+                        targets.append(f"http://{ip}")
+                    else:
+                        targets.append(f"http://{ip}:{port}")
+                        # Also try HTTPS for non-standard ports
+                        if port not in [80]:
+                            targets.append(f"https://{ip}:{port}")
+                else:
+                    # For non-web services, use host:port format
+                    targets.append(f"{ip}:{port}")
+            
+            # Write target file
+            if targets:
+                target_file = out_dir / 'targets.txt'
+                with open(target_file, 'w') as f:
+                    f.write('\n'.join(targets))
+                target_files[category] = target_file
+                logger.info(f"  {category:12} : {len(targets):4} targets -> {target_file}")
+        
+        logger.info(f"\n✓ Built {len(target_files)} target lists\n")
+        return target_files
+    
+    def scan_category(self, category: str, target_file: Path, out_dir: Path):
+        """Run Nuclei scan for a specific service category"""
+        logger.info(f"Scanning {category} services...")
+        
+        # Determine templates to use
+        templates = SERVICE_CATEGORIES.get(category, {}).get('templates', ['exposures/'])
+        
+        # Build nuclei command
+        output_file = out_dir / 'nuclei_results.json'
+        log_file = out_dir / 'nuclei.log'
         
         cmd = [
             'nuclei',
-            '-l', str(live_file),
-            '-tags', 'tech,detect,exposure',
-            '-severity', 'info,low,medium,high,critical',
+            '-l', str(target_file),
             '-json',
             '-o', str(output_file),
-            '-stats',
-            '-silent',
+            '-severity', self.args.severity,
             '-rate-limit', str(self.args.rate_limit),
             '-concurrency', str(self.args.concurrency),
             '-timeout', str(self.args.timeout),
             '-retries', str(self.args.retries),
         ]
         
+        # Add template paths
+        if category == 'web':
+            # Web services get http templates
+            cmd.extend(['-t', 'http/exposures/', '-t', 'http/cves/', 
+                       '-t', 'http/vulnerabilities/', '-t', 'http/misconfiguration/'])
+        elif category in ['database', 'network', 'iot']:
+            # Network-based services
+            cmd.extend(['-t', 'network/'])
+        else:
+            # Default templates
+            cmd.extend(['-t', 'exposures/'])
+        
         if self.args.verbose:
-            cmd.remove('-silent')
             cmd.append('-v')
+        else:
+            cmd.append('-silent')
         
-        logger.info(f"Running technology detection with {self.args.concurrency} concurrent requests...")
-        
+        # Run scan
         with open(log_file, 'w') as log:
             result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
         
         if result.returncode != 0:
-            logger.warning(f"Nuclei tech detection exited with code {result.returncode}")
+            logger.warning(f"Nuclei scan for {category} exited with code {result.returncode}")
         
-        # Parse detected technologies
+        # Parse results and create human-readable output
+        findings_count = 0
         if output_file.exists():
-            with open(output_file, 'r') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line.strip())
-                        host = data.get('host', '')
-                        template_id = data.get('template-id', '').lower()
-                        info = data.get('info', {})
-                        
-                        if host:
-                            if host not in self.tech_detected:
-                                self.tech_detected[host] = []
-                            
-                            # Extract tech from template ID and tags
-                            for tech, tags in TECH_TEMPLATE_MAP.items():
-                                if any(tag in template_id for tag in tags):
-                                    if tech not in self.tech_detected[host]:
-                                        self.tech_detected[host].append(tech)
-                            
-                            # Also check template tags
-                            template_tags = info.get('tags', [])
-                            for tag in template_tags:
-                                tag_lower = tag.lower()
-                                if tag_lower in TECH_TEMPLATE_MAP:
-                                    if tag_lower not in self.tech_detected[host]:
-                                        self.tech_detected[host].append(tag_lower)
-                    
-                    except json.JSONDecodeError:
-                        continue
-        
-        # Generate tech summary
-        tech_summary_file = self.dirs['stage2'] / 'tech_summary.txt'
-        with open(tech_summary_file, 'w') as f:
-            f.write("Technology Detection Summary\n")
-            f.write("=" * 60 + "\n\n")
-            
-            for target, techs in sorted(self.tech_detected.items()):
-                f.write(f"{target}\n")
-                if techs:
-                    for tech in sorted(techs):
-                        f.write(f"  - {tech}\n")
-                else:
-                    f.write("  - No specific technologies detected\n")
-                f.write("\n")
-        
-        logger.info(f"✓ Technology detection complete for {len(self.tech_detected)} targets")
-        logger.info(f"✓ Summary written to {tech_summary_file}")
-    
-    def stage3_build_scan_queue(self):
-        """Stage 3: Build targeted scan queue based on detected technologies"""
-        logger.info("=" * 60)
-        logger.info("STAGE 3: Building Targeted Scan Queue")
-        logger.info("=" * 60)
-        
-        for target in self.live_targets:
-            self.scan_queue[target] = set()
-            
-            # Add default templates based on severity level
-            for template in SEVERITY_TEMPLATES.get(self.args.severity, DEFAULT_TEMPLATES):
-                self.scan_queue[target].add(template)
-            
-            # Add technology-specific templates
-            techs = self.tech_detected.get(target, [])
-            for tech in techs:
-                tags = TECH_TEMPLATE_MAP.get(tech, [])
-                for tag in tags:
-                    self.scan_queue[target].add(tag)
-        
-        # Write scan queue summary
-        queue_file = self.dirs['stage3'] / 'scan_queue.txt'
-        with open(queue_file, 'w') as f:
-            f.write("Targeted Scan Queue\n")
-            f.write("=" * 60 + "\n\n")
-            
-            for target, tags in sorted(self.scan_queue.items()):
-                f.write(f"{target}\n")
-                f.write(f"  Templates: {', '.join(sorted(tags))}\n\n")
-        
-        total_scans = sum(len(tags) for tags in self.scan_queue.values())
-        logger.info(f"✓ Built scan queue: {total_scans} template groups across {len(self.scan_queue)} targets")
-    
-    def stage4_targeted_scan(self):
-        """Stage 4: Run targeted Nuclei scans per target"""
-        logger.info("=" * 60)
-        logger.info("STAGE 4: Targeted Vulnerability Scanning")
-        logger.info("=" * 60)
-        
-        # Prepare per-target scan jobs
-        scan_jobs = []
-        for target, tags in self.scan_queue.items():
-            if tags:
-                scan_jobs.append((target, tags))
-        
-        logger.info(f"Scanning {len(scan_jobs)} targets with {self.args.parallel} parallel jobs...")
-        
-        # Execute scans in parallel
-        completed = 0
-        with ThreadPoolExecutor(max_workers=self.args.parallel) as executor:
-            futures = {
-                executor.submit(self._scan_target, target, tags): target 
-                for target, tags in scan_jobs
-            }
-            
-            for future in as_completed(futures):
-                target = futures[future]
-                try:
-                    future.result()
-                    completed += 1
-                    logger.info(f"Progress: {completed}/{len(scan_jobs)} targets completed")
-                except Exception as e:
-                    logger.error(f"Error scanning {target}: {e}")
-        
-        logger.info("✓ Targeted scanning complete")
-    
-    def _scan_target(self, target: str, tags: Set[str]):
-        """Scan a single target with specified template tags"""
-        # Sanitize target for filename
-        safe_target = target.replace('://', '_').replace('/', '_').replace(':', '_')
-        target_dir = self.dirs['stage4'] / safe_target
-        target_dir.mkdir(exist_ok=True)
-        
-        output_file = target_dir / 'results.json'
-        log_file = target_dir / 'scan.log'
-        
-        # Create temporary target file
-        target_file = target_dir / 'target.txt'
-        with open(target_file, 'w') as f:
-            f.write(target)
-        
-        # Build command with all tags
-        cmd = [
-            'nuclei',
-            '-l', str(target_file),
-            '-tags', ','.join(tags),
-            '-severity', self.args.severity if self.args.severity != 'all' else 'info,low,medium,high,critical',
-            '-json',
-            '-o', str(output_file),
-            '-silent',
-            '-rate-limit', str(self.args.rate_limit),
-            '-timeout', str(self.args.timeout),
-            '-retries', str(self.args.retries),
-        ]
-        
-        # Run scan
-        with open(log_file, 'w') as log:
-            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
-        
-        # Also save human-readable output
-        if output_file.exists():
-            readable_file = target_dir / 'results.txt'
+            readable_file = out_dir / 'findings.txt'
             with open(readable_file, 'w') as out:
+                out.write(f"Nuclei Scan Results - {category.upper()}\n")
+                out.write("=" * 80 + "\n\n")
+                
                 with open(output_file, 'r') as f:
                     for line in f:
                         try:
                             data = json.loads(line.strip())
-                            out.write(f"\n{'=' * 60}\n")
+                            findings_count += 1
+                            
+                            out.write(f"\n{'=' * 80}\n")
+                            out.write(f"Finding #{findings_count}\n")
+                            out.write(f"{'=' * 80}\n")
                             out.write(f"Template: {data.get('template-id', 'unknown')}\n")
+                            out.write(f"Name: {data.get('info', {}).get('name', 'unknown')}\n")
                             out.write(f"Severity: {data.get('info', {}).get('severity', 'unknown').upper()}\n")
-                            out.write(f"URL: {data.get('matched-at', target)}\n")
+                            out.write(f"Target: {data.get('matched-at', data.get('host', 'unknown'))}\n")
                             
                             if 'extracted-results' in data:
                                 out.write(f"Extracted: {data['extracted-results']}\n")
@@ -513,42 +393,88 @@ class StagedNucleiScanner:
                             if 'matcher-name' in data:
                                 out.write(f"Matcher: {data['matcher-name']}\n")
                             
-                            out.write(f"{'=' * 60}\n")
+                            if 'description' in data.get('info', {}):
+                                out.write(f"Description: {data['info']['description']}\n")
+                            
                         except json.JSONDecodeError:
                             continue
+        
+        logger.info(f"  ✓ {category}: {findings_count} findings")
+        return findings_count
     
-    def generate_summary(self):
+    def run_all_scans(self, target_files: Dict[str, Path]):
+        """Run Nuclei scans for all service categories"""
+        logger.info("=" * 60)
+        logger.info("STAGE 2: Running Targeted Vulnerability Scans")
+        logger.info("=" * 60)
+        
+        total_findings = {}
+        
+        # Map categories to output directories
+        category_dir_map = {
+            'web': self.dirs['06_web'],
+            'database': self.dirs['04_db'],
+            'network': self.dirs['05_network'],
+            'iot': self.dirs['07_iot'],
+            'devops': self.dirs['08_devops'],
+            'other': self.dirs['09_other'],
+        }
+        
+        for category, target_file in target_files.items():
+            out_dir = category_dir_map.get(category, self.dirs['09_other'])
+            count = self.scan_category(category, target_file, out_dir)
+            total_findings[category] = count
+        
+        logger.info("\n✓ All scans complete")
+        logger.info("\nFindings Summary:")
+        for category in sorted(total_findings.keys()):
+            logger.info(f"  {category:12} : {total_findings[category]:4} findings")
+        
+        return total_findings
+    
+    
+    def generate_summary(self, findings_by_category: Dict[str, int]):
         """Generate final summary report"""
         logger.info("=" * 60)
-        logger.info("Generating Summary Report")
+        logger.info("STAGE 3: Generating Summary Report")
         logger.info("=" * 60)
         
-        summary_file = self.output_dir / 'SUMMARY.txt'
+        summary_file = self.output_dir / 'NUCLEI_SUMMARY.txt'
         findings_by_severity = {'critical': [], 'high': [], 'medium': [], 'low': [], 'info': []}
         
-        # Collect all findings
-        for target_dir in self.dirs['stage4'].iterdir():
-            if target_dir.is_dir():
-                results_file = target_dir / 'results.json'
-                if results_file.exists():
-                    with open(results_file, 'r') as f:
-                        for line in f:
-                            try:
-                                data = json.loads(line.strip())
-                                severity = data.get('info', {}).get('severity', 'info').lower()
+        # Collect all findings from all category directories
+        for dir_name, dir_path in self.dirs.items():
+            if dir_name == 'base':
+                continue
+            
+            results_file = dir_path / 'nuclei_results.json'
+            if results_file.exists():
+                with open(results_file, 'r') as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line.strip())
+                            severity = data.get('info', {}).get('severity', 'info').lower()
+                            if severity in findings_by_severity:
                                 findings_by_severity[severity].append(data)
-                            except json.JSONDecodeError:
-                                continue
+                        except json.JSONDecodeError:
+                            continue
         
         # Write summary
         with open(summary_file, 'w') as f:
-            f.write("NUCLEI SCAN SUMMARY REPORT\n")
+            f.write("NUCLEI VULNERABILITY SCAN SUMMARY\n")
             f.write("=" * 80 + "\n\n")
             
             f.write(f"Scan Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Targets: {len(self.targets)}\n")
-            f.write(f"Live Services: {len(self.live_targets)}\n")
-            f.write(f"Technologies Detected: {sum(len(t) for t in self.tech_detected.values())}\n\n")
+            f.write(f"Nmap Source: {self.nmap_dir}\n")
+            f.write(f"Total Services Discovered: {len(self.all_services)}\n\n")
+            
+            f.write("SERVICES BY CATEGORY\n")
+            f.write("-" * 80 + "\n")
+            for category in sorted(self.services.keys()):
+                count = len(self.services[category])
+                f.write(f"{category:12} : {count:4} services\n")
+            
+            f.write("\n" + "=" * 80 + "\n\n")
             
             f.write("FINDINGS BY SEVERITY\n")
             f.write("-" * 80 + "\n")
@@ -558,16 +484,23 @@ class StagedNucleiScanner:
             
             f.write("\n" + "=" * 80 + "\n\n")
             
-            # Detailed findings
-            for severity in ['critical', 'high', 'medium', 'low', 'info']:
+            f.write("FINDINGS BY CATEGORY\n")
+            f.write("-" * 80 + "\n")
+            for category in sorted(findings_by_category.keys()):
+                f.write(f"{category:12} : {findings_by_category[category]:4} findings\n")
+            
+            f.write("\n" + "=" * 80 + "\n\n")
+            
+            # Detailed findings (top findings per severity)
+            for severity in ['critical', 'high', 'medium', 'low']:
                 findings = findings_by_severity[severity]
                 if findings:
-                    f.write(f"\n{severity.upper()} SEVERITY FINDINGS ({len(findings)})\n")
+                    f.write(f"\n{severity.upper()} SEVERITY FINDINGS (Top 20)\n")
                     f.write("-" * 80 + "\n\n")
                     
-                    for finding in findings[:50]:  # Limit to 50 per severity
+                    for finding in findings[:20]:
                         f.write(f"Template: {finding.get('template-id', 'unknown')}\n")
-                        f.write(f"Target: {finding.get('matched-at', 'unknown')}\n")
+                        f.write(f"Target: {finding.get('matched-at', finding.get('host', 'unknown'))}\n")
                         f.write(f"Name: {finding.get('info', {}).get('name', 'unknown')}\n")
                         
                         if 'extracted-results' in finding:
@@ -576,88 +509,110 @@ class StagedNucleiScanner:
                         f.write("\n")
             
             f.write("\n" + "=" * 80 + "\n")
-            f.write("Detailed results available in: " + str(self.dirs['stage4']) + "\n")
+            f.write("DETAILED RESULTS BY CATEGORY:\n")
+            f.write(f"  Web Services:     {self.dirs['06_web']}/\n")
+            f.write(f"  Database Services: {self.dirs['04_db']}/\n")
+            f.write(f"  Network Services:  {self.dirs['05_network']}/\n")
+            f.write(f"  IoT Services:      {self.dirs['07_iot']}/\n")
+            f.write(f"  DevOps Services:   {self.dirs['08_devops']}/\n")
+            f.write(f"  Other Services:    {self.dirs['09_other']}/\n")
         
         logger.info(f"✓ Summary report: {summary_file}")
         
         # Print summary to console
         print("\n" + "=" * 80)
-        print("SCAN COMPLETE - FINDINGS SUMMARY")
+        print("NUCLEI SCAN COMPLETE - FINDINGS SUMMARY")
         print("=" * 80)
+        print("\nBy Severity:")
         for severity in ['critical', 'high', 'medium', 'low', 'info']:
             count = len(findings_by_severity[severity])
-            print(f"{severity.upper():12} : {count:4} findings")
+            print(f"  {severity.upper():12} : {count:4} findings")
+        
+        print("\nBy Category:")
+        for category in sorted(findings_by_category.keys()):
+            print(f"  {category:12} : {findings_by_category[category]:4} findings")
+        
         print("=" * 80)
         print(f"\nFull report: {summary_file}")
-        print(f"Detailed scans: {self.dirs['stage4']}/")
-        print(f"Screenshot gallery: {self.dirs['stage1']}/report.html")
+        print(f"Service summary: {self.output_dir / 'service_summary.txt'}")
     
     def run(self):
-        """Execute the full staged scan"""
+        """Execute the full Nmap -> Nuclei workflow"""
         start_time = time.time()
         
-        logger.info("Starting Staged Nuclei Scanner")
+        logger.info("=" * 60)
+        logger.info("Nmap-Nuclei Service Vulnerability Scanner")
+        logger.info("=" * 60)
+        logger.info("")
+        
+        # Check prerequisites
         self.check_requirements()
         
-        # Load and prepare targets
-        targets_file = self.load_targets()
+        # Stage 0: Parse Nmap results
+        self.load_nmap_results()
         
-        # Stage 0: Service discovery
-        live_file = self.stage0_discovery(targets_file)
+        if not self.all_services:
+            logger.error("No services found in Nmap results!")
+            sys.exit(1)
         
-        # Stage 1: Screenshots
-        self.stage1_screenshots(live_file)
+        # Stage 1: Build target lists
+        target_files = self.build_target_lists()
         
-        # Stage 2: Technology detection
-        self.stage2_tech_detection(live_file)
+        if not target_files:
+            logger.error("No targets to scan!")
+            sys.exit(1)
         
-        # Stage 3: Build scan queue
-        self.stage3_build_scan_queue()
+        # Stage 2: Run Nuclei scans
+        findings = self.run_all_scans(target_files)
         
-        # Stage 4: Targeted scanning
-        self.stage4_targeted_scan()
-        
-        # Generate summary
-        self.generate_summary()
+        # Stage 3: Generate summary
+        self.generate_summary(findings)
         
         elapsed = time.time() - start_time
         logger.info(f"\n✓ Total scan time: {elapsed/60:.1f} minutes")
+        logger.info(f"✓ Output directory: {self.output_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Staged Nuclei Scanner with Technology Detection',
+        description='Service-Aware Nuclei Scanner for Nmap Output',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic scan with auto-detection
-  python3 staged_nuclei.py -i targets.txt -o out_scan
+  # Scan services from nmap output (results go in same directory)
+  python3 staged_nuclei.py -n out_bigscan
 
-  # High-severity only with more parallelism
-  python3 staged_nuclei.py -i targets.txt -o out_scan -s high -j 10
+  # High-severity only
+  python3 staged_nuclei.py -n out_bigscan -s high
 
-  # Verbose mode for debugging
-  python3 staged_nuclei.py -i targets.txt -o out_scan -v
+  # Verbose mode
+  python3 staged_nuclei.py -n out_bigscan -v
+
+Expected Input:
+  The script expects Nmap output from staged_nmap.py:
+    - <nmap_dir>/03_enum/*.xml (Nmap XML files with service details)
+    - <nmap_dir>/open_ports_summary.txt (optional, for quick reference)
+
+Output Structure (within nmap directory):
+  <nmap_dir>/04_db/       - Database service vulnerabilities
+  <nmap_dir>/05_network/  - Network service vulnerabilities
+  <nmap_dir>/06_web/      - Web application vulnerabilities
+  <nmap_dir>/07_iot/      - IoT service vulnerabilities
+  <nmap_dir>/08_devops/   - DevOps platform vulnerabilities
+  <nmap_dir>/09_other/    - Other service vulnerabilities
         """
     )
     
-    parser.add_argument('-i', '--input', required=True,
-                       help='Input file with targets (URLs, IPs, domains)')
-    parser.add_argument('-o', '--output', required=True,
-                       help='Output directory for results')
+    parser.add_argument('-n', '--nmap-output', required=True,
+                       help='Nmap output directory from staged_nmap.py (Nuclei results will be added here)')
     
     # Severity and scope
-    parser.add_argument('-s', '--severity', default='medium',
-                       choices=['critical', 'high', 'medium', 'all'],
-                       help='Minimum severity level (default: medium)')
+    parser.add_argument('-s', '--severity', default='medium,high,critical',
+                       help='Severity levels to scan (default: medium,high,critical)')
     
     # Performance tuning
-    parser.add_argument('-j', '--parallel', type=int, default=5,
-                       help='Parallel target scans in Stage 3 (default: 5)')
     parser.add_argument('-c', '--concurrency', type=int, default=25,
                        help='Concurrent templates per scan (default: 25)')
-    parser.add_argument('-t', '--threads', type=int, default=50,
-                       help='Threads for httpx discovery (default: 50)')
     parser.add_argument('-rl', '--rate-limit', type=int, default=150,
                        help='Max requests per second (default: 150)')
     parser.add_argument('--timeout', type=int, default=10,
@@ -671,13 +626,13 @@ Examples:
     
     args = parser.parse_args()
     
-    # Validate
-    if not os.path.exists(args.input):
-        logger.error(f"Input file not found: {args.input}")
+    # Validate nmap output exists
+    if not os.path.exists(args.nmap_output):
+        logger.error(f"Nmap output directory not found: {args.nmap_output}")
         sys.exit(1)
     
     # Run scanner
-    scanner = StagedNucleiScanner(args)
+    scanner = NmapNucleiScanner(args)
     scanner.run()
 
 
