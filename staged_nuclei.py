@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Service categorization based on port and service name
 SERVICE_CATEGORIES = {
     'web': {
-        'ports': [80, 443, 8000, 8080, 8443, 8888, 3000, 5000, 9000],
+        'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 5000, 9000, 9090],
         'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt'],
         'templates': ['http/exposures/', 'http/cves/', 'http/vulnerabilities/', 
                      'http/misconfiguration/', 'http/default-logins/', 'http/token-spray/']
@@ -142,9 +142,11 @@ class NmapNucleiScanner:
             logger.error("Expected directory structure from staged_nmap.py output")
             sys.exit(1)
         
-        # Update nuclei templates
-        #logger.info("Updating Nuclei templates...")
-        #subprocess.run(['nuclei', '-ut'], capture_output=True)
+        # Verify nuclei templates are available
+        logger.info("Verifying Nuclei templates...")
+        result = subprocess.run(['nuclei', '-tl', '-duc'], capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning("Unable to verify templates, but continuing...")
     
     def parse_nmap_xml(self, xml_path: Path) -> List[Dict]:
         """Parse an Nmap XML file and extract service information"""
@@ -331,8 +333,6 @@ class NmapNucleiScanner:
         
         cmd = [
             'nuclei',
-            '-duc',
-            '-ni',
             '-l', str(target_file),
             '-json',
             '-o', str(output_file),
@@ -341,6 +341,8 @@ class NmapNucleiScanner:
             '-concurrency', str(self.args.concurrency),
             '-timeout', str(self.args.timeout),
             '-retries', str(self.args.retries),
+            '-duc',  # Don't check for updates
+            '-ni',   # No interactivity
         ]
         
         # Add template paths
