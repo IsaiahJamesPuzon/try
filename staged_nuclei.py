@@ -143,8 +143,8 @@ class NmapNucleiScanner:
             sys.exit(1)
         
         # Update nuclei templates
-        logger.info("Updating Nuclei templates...")
-        subprocess.run(['nuclei', '-ut'], capture_output=True)
+        #logger.info("Updating Nuclei templates...")
+        #subprocess.run(['nuclei', '-ut'], capture_output=True)
     
     def parse_nmap_xml(self, xml_path: Path) -> List[Dict]:
         """Parse an Nmap XML file and extract service information"""
@@ -331,6 +331,8 @@ class NmapNucleiScanner:
         
         cmd = [
             'nuclei',
+            '-duc',
+            '-ni',
             '-l', str(target_file),
             '-json',
             '-o', str(output_file),
