@@ -334,7 +334,7 @@ class NmapNucleiScanner:
         cmd = [
             'nuclei',
             '-l', str(target_file),
-            '-json',
+            '-jsonl',  # Output in JSONL format (v3+ syntax)
             '-o', str(output_file),
             '-severity', self.args.severity,
             '-rate-limit', str(self.args.rate_limit),
@@ -357,14 +357,31 @@ class NmapNucleiScanner:
             # Default templates
             cmd.extend(['-t', 'exposures/'])
         
-        if self.args.verbose:
-            cmd.append('-v')
+        # Always show progress unless explicitly silenced
+        if not self.args.silent:
+            cmd.append('-v')  # Verbose output to see scanning progress
         else:
             cmd.append('-silent')
         
-        # Run scan
+        # Run scan with real-time output
+        logger.info(f"  Command: {' '.join(cmd)}")
         with open(log_file, 'w') as log:
-            result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+            # Use Popen to show output in real-time while also logging
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            # Stream output to both console and log file
+            for line in process.stdout:
+                print(line, end='')  # Real-time output to console
+                log.write(line)  # Save to log file
+            
+            process.wait()
+            result = process
         
         if result.returncode != 0:
             logger.warning(f"Nuclei scan for {category} exited with code {result.returncode}")
@@ -625,8 +642,8 @@ Output Structure (within nmap directory):
                        help='Number of retries (default: 1)')
     
     # Output control
-    parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Verbose output')
+    parser.add_argument('--silent', action='store_true',
+                       help='Silent mode (no progress output, only results)')
     
     args = parser.parse_args()
     
