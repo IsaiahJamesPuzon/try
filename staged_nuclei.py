@@ -35,64 +35,142 @@ logger = logging.getLogger(__name__)
 
 
 # Service categorization based on port and service name
+# Optimized to use specific template directories from https://github.com/projectdiscovery/nuclei-templates
 SERVICE_CATEGORIES = {
     'web': {
-        'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 5000, 9000, 9090],
-        'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt'],
-        'templates': ['http/exposures/', 'http/cves/', 'http/vulnerabilities/', 
-                     'http/misconfiguration/', 'http/default-logins/', 'http/token-spray/']
+        'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 4443, 5000, 7001, 8008, 8009, 9000, 9090, 9443],
+        'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt', 'http-rpc-epmap'],
+        'templates': [
+            'http/cves/',              # CVE-based vulnerabilities (highest priority)
+            'http/vulnerabilities/',   # Known security vulnerabilities
+            'http/exposures/',         # Exposed services, panels, admin interfaces
+            'http/misconfiguration/',  # Misconfigurations
+            'http/technologies/',      # Technology detection and fingerprinting
+        ],
+        'scan_ssl': True  # Also scan for SSL/TLS issues on HTTPS
     },
     'database': {
-        'ports': [3306, 5432, 1433, 1521, 27017, 6379, 9042, 5984, 9200],
-        'services': ['mysql', 'postgresql', 'ms-sql', 'oracle', 'mongodb', 
-                    'redis', 'cassandra', 'couchdb', 'elasticsearch'],
-        'templates': ['network/exposures/', 'network/cves/', 'network/vulnerabilities/']
+        'ports': [3306, 5432, 1433, 1521, 5984, 9042, 9200, 11211, 27017, 28017, 50000],
+        'services': ['mysql', 'postgresql', 'ms-sql', 'mssql', 'oracle', 'mongodb', 
+                    'redis', 'cassandra', 'couchdb', 'elasticsearch', 'memcached', 'db2'],
+        'templates': [
+            'network/cves/',           # Database CVEs
+            'network/exposures/',      # Exposed database instances
+            'network/vulnerabilities/', # Database vulnerabilities
+        ],
+        'network_protocol': True  # Use network protocol scanning
     },
     'network': {
         'ports': [21, 22, 23, 25, 53, 110, 143, 161, 389, 445, 548, 636, 
-                 873, 1099, 2049, 3389, 5900, 5985, 5986],
+                 873, 1099, 2049, 3389, 5900, 5985, 5986, 6379],
         'services': ['ftp', 'ssh', 'telnet', 'smtp', 'dns', 'pop3', 'imap', 
                     'snmp', 'ldap', 'microsoft-ds', 'smb', 'afp', 'ldaps',
                     'rsync', 'rmi', 'nfs', 'ms-wbt-server', 'rdp', 'vnc', 
-                    'winrm', 'wsman'],
-        'templates': ['network/exposures/', 'network/cves/', 'network/detection/']
+                    'winrm', 'wsman', 'netbios-ssn'],
+        'templates': [
+            'network/cves/',           # Network service CVEs
+            'network/exposures/',      # Exposed network services
+            'network/detection/',      # Service detection
+        ],
+        'network_protocol': True
     },
     'iot': {
-        'ports': [1883, 8883, 5683, 502, 20000],
-        'services': ['mqtt', 'mqtts', 'coap', 'modbus', 'dnp3'],
-        'templates': ['iot/']
+        'ports': [1883, 8883, 5683, 502, 20000, 47808, 1900, 5000, 8000],
+        'services': ['mqtt', 'mqtts', 'coap', 'modbus', 'dnp3', 'upnp', 'iot'],
+        'templates': [
+            'iot/',                    # IoT-specific templates
+            'network/exposures/',      # Exposed IoT services
+        ],
+        'network_protocol': True
     },
     'devops': {
-        'ports': [2375, 2376, 6443, 9418, 50000],
-        'services': ['docker', 'kubernetes', 'k8s', 'git', 'jenkins'],
-        'templates': ['exposures/', 'misconfiguration/', 'cves/']
+        'ports': [2375, 2376, 6443, 8443, 9418, 50000, 9000, 4040],
+        'services': ['docker', 'kubernetes', 'k8s', 'git', 'jenkins', 'gitlab', 'rancher'],
+        'templates': [
+            'http/cves/',              # DevOps CVEs
+            'http/exposures/',         # Exposed DevOps interfaces
+            'http/misconfiguration/',  # DevOps misconfigurations
+            'http/technologies/',      # Technology detection
+        ],
+        'scan_ssl': True
+    },
+    'api': {
+        'ports': [8000, 8080, 8443, 3000, 5000, 9000],
+        'services': ['api', 'rest', 'graphql', 'soap'],
+        'templates': [
+            'http/exposures/',         # Exposed API endpoints
+            'http/vulnerabilities/',   # API vulnerabilities
+            'http/misconfiguration/',  # API misconfigurations
+            'http/technologies/',      # API technology detection
+        ],
+        'scan_ssl': True
+    },
+    'messaging': {
+        'ports': [5672, 15672, 9092, 2181, 4369, 5671, 61616],
+        'services': ['amqp', 'rabbitmq', 'kafka', 'zookeeper', 'activemq', 'mqtt'],
+        'templates': [
+            'network/exposures/',      # Exposed messaging services
+            'network/cves/',           # Messaging CVEs
+        ],
+        'network_protocol': True
     }
 }
 
-# Port-specific Nuclei templates
-PORT_TEMPLATE_MAP = {
-    # Web servers
-    80: 'http',
-    443: 'ssl',
-    8080: 'http',
-    8443: 'ssl',
-    8000: 'http',
-    8888: 'http',
+# Technology-specific Nuclei templates and workflows
+# Maps detected products/services to specific templates or workflows
+TECH_SPECIFIC_TEMPLATES = {
+    # According to https://github.com/projectdiscovery/nuclei-templates
+    
+    # Workflows for specific technologies
+    'wordpress': {'type': 'workflow', 'path': 'workflows/wordpress-workflow.yaml'},
+    'joomla': {'type': 'workflow', 'path': 'workflows/joomla-workflow.yaml'},
+    'drupal': {'type': 'workflow', 'path': 'workflows/drupal-workflow.yaml'},
+    'magento': {'type': 'workflow', 'path': 'workflows/magento-workflow.yaml'},
+    'prestashop': {'type': 'workflow', 'path': 'workflows/prestashop-workflow.yaml'},
+    'opencart': {'type': 'workflow', 'path': 'workflows/opencart-workflow.yaml'},
+    'moodle': {'type': 'workflow', 'path': 'workflows/moodle-workflow.yaml'},
+    'gitlab': {'type': 'workflow', 'path': 'workflows/gitlab-workflow.yaml'},
+    'jenkins': {'type': 'workflow', 'path': 'workflows/jenkins-workflow.yaml'},
+    'sharepoint': {'type': 'workflow', 'path': 'workflows/sharepoint-workflow.yaml'},
+    'confluence': {'type': 'workflow', 'path': 'workflows/atlassian-confluence-workflow.yaml'},
+    'jira': {'type': 'workflow', 'path': 'workflows/atlassian-jira-workflow.yaml'},
+    
+    # Network exposures for specific services
+    'zookeeper': {'type': 'template', 'path': 'network/exposures/'},
+    'apache-zookeeper': {'type': 'template', 'path': 'network/exposures/'},
+    'dolibarr': {'type': 'template', 'path': 'network/exposures/'},
+    'kafka': {'type': 'template', 'path': 'network/exposures/'},
+    'cassandra': {'type': 'template', 'path': 'network/exposures/'},
+    'memcached': {'type': 'template', 'path': 'network/exposures/'},
+    'couchdb': {'type': 'template', 'path': 'network/exposures/'},
+    'consul': {'type': 'template', 'path': 'network/exposures/'},
+    'etcd': {'type': 'template', 'path': 'network/exposures/'},
+    'influxdb': {'type': 'template', 'path': 'network/exposures/'},
+    'grafana': {'type': 'template', 'path': 'network/exposures/'},
+    
+    # Docker/Container platforms
+    'docker': {'type': 'template', 'path': 'http/exposures/', 'tags': 'docker'},
+    'kubernetes': {'type': 'template', 'path': 'http/exposures/', 'tags': 'kubernetes'},
+    'k8s': {'type': 'template', 'path': 'http/exposures/', 'tags': 'kubernetes'},
+    
+    # CMS platforms (if no workflow available, use targeted templates)
+    'cms': {'type': 'template', 'path': 'http/technologies/'},
+    'typo3': {'type': 'template', 'path': 'http/technologies/'},
+    'phpmyadmin': {'type': 'template', 'path': 'http/exposures/', 'tags': 'phpmyadmin'},
     
     # Databases
-    3306: 'mysql',
-    5432: 'postgresql',
-    27017: 'mongodb',
-    6379: 'redis',
-    9200: 'elasticsearch',
+    'mysql': {'type': 'template', 'path': 'network/exposures/', 'tags': 'mysql'},
+    'postgresql': {'type': 'template', 'path': 'network/exposures/', 'tags': 'postgres'},
+    'mongodb': {'type': 'template', 'path': 'network/exposures/', 'tags': 'mongodb'},
+    'redis': {'type': 'template', 'path': 'network/exposures/', 'tags': 'redis'},
+    'elasticsearch': {'type': 'template', 'path': 'network/exposures/', 'tags': 'elastic'},
     
-    # Network services
-    21: 'ftp',
-    22: 'ssh',
-    23: 'telnet',
-    445: 'smb',
-    3389: 'rdp',
-    5900: 'vnc',
+    # Web servers
+    'apache': {'type': 'template', 'path': 'http/misconfiguration/', 'tags': 'apache'},
+    'nginx': {'type': 'template', 'path': 'http/misconfiguration/', 'tags': 'nginx'},
+    'iis': {'type': 'template', 'path': 'http/misconfiguration/', 'tags': 'iis'},
+    'tomcat': {'type': 'template', 'path': 'http/exposures/', 'tags': 'tomcat'},
+    'jetty': {'type': 'template', 'path': 'http/exposures/', 'tags': 'jetty'},
 }
 
 
@@ -108,6 +186,7 @@ class NmapNucleiScanner:
         # Service data structures
         self.services = defaultdict(list)  # category -> [(ip, port, service, product)]
         self.all_services = []  # all discovered services
+        self.tech_specific_targets = defaultdict(list)  # technology -> list of targets
         
         # Create output structure by service category within same directory
         self.dirs = {
@@ -115,9 +194,11 @@ class NmapNucleiScanner:
             '04_db': self.output_dir / '04_db',
             '05_network': self.output_dir / '05_network',
             '06_web': self.output_dir / '06_web',
-            '07_iot': self.output_dir / '07_iot',
-            '08_devops': self.output_dir / '08_devops',
-            '09_other': self.output_dir / '09_other',
+            '07_api': self.output_dir / '07_api',
+            '08_iot': self.output_dir / '08_iot',
+            '09_devops': self.output_dir / '09_devops',
+            '10_messaging': self.output_dir / '10_messaging',
+            '11_other': self.output_dir / '11_other',
         }
         
         for dir_path in self.dirs.values():
@@ -215,6 +296,39 @@ class NmapNucleiScanner:
         
         return 'other'
     
+    def detect_technology(self, service: Dict):
+        """Detect specific technologies for targeted template selection"""
+        product = service.get('product', '').lower()
+        service_name = service.get('service', '').lower()
+        version = service.get('version', '').lower()
+        
+        # Check if product/service matches known technologies
+        for tech, config in TECH_SPECIFIC_TEMPLATES.items():
+            if tech in product or tech in service_name or tech in version:
+                # Build appropriate target
+                ip = service['ip']
+                port = service['port']
+                tunnel = service.get('tunnel', '')
+                
+                # Format target based on service type
+                if 'http' in service_name or port in [80, 443, 8000, 8080, 8443, 8888]:
+                    if port == 443 or tunnel == 'ssl' or 'https' in service_name:
+                        target = f"https://{ip}:{port}"
+                    elif port == 80:
+                        target = f"http://{ip}"
+                    else:
+                        target = f"http://{ip}:{port}"
+                else:
+                    target = f"{ip}:{port}"
+                
+                self.tech_specific_targets[tech].append({
+                    'target': target,
+                    'config': config,
+                    'service': service
+                })
+                
+                logger.info(f"  ⚡ Detected {tech.upper()} on {target}")
+    
     def load_nmap_results(self):
         """Parse all Nmap XML results and categorize services"""
         logger.info("=" * 60)
@@ -233,10 +347,13 @@ class NmapNucleiScanner:
         
         logger.info(f"✓ Discovered {len(self.all_services)} total services")
         
-        # Categorize services
+        # Categorize services and detect specific technologies
         for service in self.all_services:
             category = self.categorize_service(service)
             self.services[category].append(service)
+            
+            # Check for technology-specific templates
+            self.detect_technology(service)
         
         # Print summary
         logger.info("\nService Distribution:")
@@ -257,7 +374,16 @@ class NmapNucleiScanner:
                     f.write(f"{svc['ip']:15} {svc['port']:5} {svc['service']:20} "
                            f"{svc['product']} {svc['version']}\n")
         
-        logger.info(f"✓ Service summary: {summary_file}\n")
+        logger.info(f"✓ Service summary: {summary_file}")
+        
+        # Report detected technologies
+        if self.tech_specific_targets:
+            logger.info("\n⚡ Detected Technologies (will use targeted templates):")
+            for tech in sorted(self.tech_specific_targets.keys()):
+                count = len(self.tech_specific_targets[tech])
+                tech_type = self.tech_specific_targets[tech][0]['config']['type']
+                logger.info(f"  {tech:20} : {count:2} targets ({tech_type})")
+        logger.info("")
     
     def build_target_lists(self):
         """Build target lists for each service category"""
@@ -278,12 +404,16 @@ class NmapNucleiScanner:
                 out_dir = self.dirs['04_db']
             elif category == 'network':
                 out_dir = self.dirs['05_network']
+            elif category == 'api':
+                out_dir = self.dirs['07_api']
             elif category == 'iot':
-                out_dir = self.dirs['07_iot']
+                out_dir = self.dirs['08_iot']
             elif category == 'devops':
-                out_dir = self.dirs['08_devops']
+                out_dir = self.dirs['09_devops']
+            elif category == 'messaging':
+                out_dir = self.dirs['10_messaging']
             else:
-                out_dir = self.dirs['09_other']
+                out_dir = self.dirs['11_other']
             
             # Build targets
             targets = []
@@ -345,17 +475,25 @@ class NmapNucleiScanner:
             '-ni',   # No interactivity
         ]
         
-        # Add template paths
-        if category == 'web':
-            # Web services get http templates
-            cmd.extend(['-t', 'http/exposures/', '-t', 'http/cves/', 
-                       '-t', 'http/vulnerabilities/', '-t', 'http/misconfiguration/'])
-        elif category in ['database', 'network', 'iot']:
-            # Network-based services
-            cmd.extend(['-t', 'network/'])
+        # Add template paths based on service category configuration
+        category_config = SERVICE_CATEGORIES.get(category, {})
+        templates = category_config.get('templates', [])
+        
+        if templates:
+            # Use specified templates for this category
+            for template in templates:
+                cmd.extend(['-t', template])
         else:
-            # Default templates
-            cmd.extend(['-t', 'exposures/'])
+            # Fallback to generic exposures
+            cmd.extend(['-t', 'http/exposures/'])
+        
+        # Add SSL/TLS scanning for categories that need it
+        if category_config.get('scan_ssl') and (
+            'https' in str(target_file.parent / 'targets.txt') or 
+            any('443' in line or 'https' in line 
+                for line in open(target_file).readlines())
+        ):
+            cmd.extend(['-t', 'ssl/'])
         
         # Always show progress unless explicitly silenced
         if not self.args.silent:
@@ -436,11 +574,21 @@ class NmapNucleiScanner:
             'web': self.dirs['06_web'],
             'database': self.dirs['04_db'],
             'network': self.dirs['05_network'],
-            'iot': self.dirs['07_iot'],
-            'devops': self.dirs['08_devops'],
-            'other': self.dirs['09_other'],
+            'api': self.dirs['07_api'],
+            'iot': self.dirs['08_iot'],
+            'devops': self.dirs['09_devops'],
+            'messaging': self.dirs['10_messaging'],
+            'other': self.dirs['11_other'],
         }
         
+        # First, run technology-specific scans
+        if self.tech_specific_targets:
+            logger.info("\n⚡ Running technology-specific scans...")
+            tech_findings = self.run_technology_scans()
+            total_findings.update(tech_findings)
+        
+        # Then run category-based scans
+        logger.info("\n📊 Running category-based scans...")
         for category, target_file in target_files.items():
             out_dir = category_dir_map.get(category, self.dirs['09_other'])
             count = self.scan_category(category, target_file, out_dir)
@@ -452,6 +600,86 @@ class NmapNucleiScanner:
             logger.info(f"  {category:12} : {total_findings[category]:4} findings")
         
         return total_findings
+    
+    def run_technology_scans(self) -> Dict[str, int]:
+        """Run targeted scans for detected technologies"""
+        tech_findings = {}
+        
+        for tech, targets_info in self.tech_specific_targets.items():
+            config = targets_info[0]['config']
+            tech_type = config['type']
+            
+            # Create technology-specific directory
+            tech_dir = self.output_dir / f'10_tech_{tech}'
+            tech_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Build target list
+            targets = [t['target'] for t in targets_info]
+            target_file = tech_dir / 'targets.txt'
+            with open(target_file, 'w') as f:
+                f.write('\n'.join(targets))
+            
+            logger.info(f"  Scanning {tech} ({tech_type})...")
+            
+            # Build nuclei command
+            output_file = tech_dir / 'nuclei_results.json'
+            log_file = tech_dir / 'nuclei.log'
+            
+            cmd = [
+                'nuclei',
+                '-l', str(target_file),
+                '-jsonl',
+                '-o', str(output_file),
+                '-severity', self.args.severity,
+                '-rate-limit', str(self.args.rate_limit),
+                '-concurrency', str(self.args.concurrency),
+                '-timeout', str(self.args.timeout),
+                '-retries', str(self.args.retries),
+                '-duc',
+                '-ni',
+            ]
+            
+            # Add workflow or template path
+            if tech_type == 'workflow':
+                cmd.extend(['-w', config['path']])
+            else:
+                cmd.extend(['-t', config['path']])
+                # Add tags if specified
+                if 'tags' in config:
+                    cmd.extend(['-tags', config['tags']])
+            
+            if not self.args.silent:
+                cmd.append('-v')
+            else:
+                cmd.append('-silent')
+            
+            # Run scan with real-time output
+            logger.info(f"  Command: {' '.join(cmd)}")
+            with open(log_file, 'w') as log:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                
+                for line in process.stdout:
+                    print(line, end='')
+                    log.write(line)
+                
+                process.wait()
+            
+            # Count findings
+            findings_count = 0
+            if output_file.exists():
+                with open(output_file, 'r') as f:
+                    findings_count = sum(1 for _ in f)
+            
+            tech_findings[f'tech_{tech}'] = findings_count
+            logger.info(f"  ✓ {tech}: {findings_count} findings\n")
+        
+        return tech_findings
     
     
     def generate_summary(self, findings_by_category: Dict[str, int]):
@@ -531,12 +759,22 @@ class NmapNucleiScanner:
             
             f.write("\n" + "=" * 80 + "\n")
             f.write("DETAILED RESULTS BY CATEGORY:\n")
-            f.write(f"  Web Services:     {self.dirs['06_web']}/\n")
-            f.write(f"  Database Services: {self.dirs['04_db']}/\n")
-            f.write(f"  Network Services:  {self.dirs['05_network']}/\n")
-            f.write(f"  IoT Services:      {self.dirs['07_iot']}/\n")
-            f.write(f"  DevOps Services:   {self.dirs['08_devops']}/\n")
-            f.write(f"  Other Services:    {self.dirs['09_other']}/\n")
+            f.write(f"  Database Services:  {self.dirs['04_db']}/\n")
+            f.write(f"  Network Services:   {self.dirs['05_network']}/\n")
+            f.write(f"  Web Services:       {self.dirs['06_web']}/\n")
+            f.write(f"  API Services:       {self.dirs['07_api']}/\n")
+            f.write(f"  IoT Services:       {self.dirs['08_iot']}/\n")
+            f.write(f"  DevOps Services:    {self.dirs['09_devops']}/\n")
+            f.write(f"  Messaging Services: {self.dirs['10_messaging']}/\n")
+            f.write(f"  Other Services:     {self.dirs['11_other']}/\n")
+            
+            # Add technology-specific results
+            if self.tech_specific_targets:
+                f.write("\nTECHNOLOGY-SPECIFIC SCANS:\n")
+                for tech in sorted(self.tech_specific_targets.keys()):
+                    tech_dir = self.output_dir / f'10_tech_{tech}'
+                    if tech_dir.exists():
+                        f.write(f"  {tech.capitalize():20}: {tech_dir}/\n")
         
         logger.info(f"✓ Summary report: {summary_file}")
         
