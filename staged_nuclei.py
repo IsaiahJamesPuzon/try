@@ -143,6 +143,11 @@ PORT_TO_SERVICE_TAG = {
     11434: 'ollama',
     9418: 'git',
     1099: 'jmx',
+    1883: 'mqtt',
+    8883: 'mqtt',
+    5672: 'rabbitmq',
+    5671: 'rabbitmq',
+    15672: 'rabbitmq',
 }
 
 # Ports that should run tech-detect first (web services and development tools)
