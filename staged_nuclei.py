@@ -41,11 +41,14 @@ SERVICE_CATEGORIES = {
         'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 4443, 5000, 7001, 8008, 8009, 9000, 9090, 9443],
         'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt', 'http-rpc-epmap'],
         'templates': [
-            'http/cves/',              # CVE-based vulnerabilities (highest priority)
-            'http/vulnerabilities/',   # Known security vulnerabilities
-            'http/exposures/',         # Exposed services, panels, admin interfaces
-            'http/misconfiguration/',  # Misconfigurations
-            'http/technologies/',      # Technology detection and fingerprinting
+            # PASSIVE RECONNAISSANCE ONLY - No exploits, just discovery
+            'http/technologies/',  # Technology fingerprinting
+            'http/exposures/apis/',  # Exposed API docs, swagger, etc.
+            'http/exposures/configs/',  # Config files, .env, etc.
+            'http/exposures/files/',  # Sensitive files
+            'http/exposures/logs/',  # Log files
+            'http/exposures/backups/',  # Backup files
+            'http/exposures/panels/',  # Admin panels, dashboards
         ],
         'scan_ssl': True  # Also scan for SSL/TLS issues on HTTPS
     },
@@ -54,9 +57,8 @@ SERVICE_CATEGORIES = {
         'services': ['mysql', 'postgresql', 'ms-sql', 'mssql', 'oracle', 'mongodb', 
                     'redis', 'cassandra', 'couchdb', 'elasticsearch', 'memcached', 'db2'],
         'templates': [
-            'network/cves/',           # Database CVEs
-            'network/exposures/',      # Exposed database instances
-            'network/vulnerabilities/', # Database vulnerabilities
+            # Detection only - check if databases are exposed/unauth
+            'network/detection/',
         ],
         'network_protocol': True  # Use network protocol scanning
     },
@@ -68,9 +70,8 @@ SERVICE_CATEGORIES = {
                     'rsync', 'rmi', 'nfs', 'ms-wbt-server', 'rdp', 'vnc', 
                     'winrm', 'wsman', 'netbios-ssn'],
         'templates': [
-            'network/cves/',           # Network service CVEs
-            'network/exposures/',      # Exposed network services
-            'network/detection/',      # Service detection
+            # Service detection and fingerprinting only
+            'network/detection/',
         ],
         'network_protocol': True
     },
@@ -78,8 +79,8 @@ SERVICE_CATEGORIES = {
         'ports': [1883, 8883, 5683, 502, 20000, 47808, 1900, 5000, 8000],
         'services': ['mqtt', 'mqtts', 'coap', 'modbus', 'dnp3', 'upnp', 'iot'],
         'templates': [
-            'iot/',                    # IoT-specific templates
-            'network/exposures/',      # Exposed IoT services
+            # IoT exposure detection only
+            'network/detection/',
         ],
         'network_protocol': True
     },
@@ -87,10 +88,11 @@ SERVICE_CATEGORIES = {
         'ports': [2375, 2376, 6443, 8443, 9418, 50000, 9000, 4040],
         'services': ['docker', 'kubernetes', 'k8s', 'git', 'jenkins', 'gitlab', 'rancher'],
         'templates': [
-            'http/cves/',              # DevOps CVEs
-            'http/exposures/',         # Exposed DevOps interfaces
-            'http/misconfiguration/',  # DevOps misconfigurations
-            'http/technologies/',      # Technology detection
+            # DevOps exposures only - dashboards, consoles, APIs
+            'http/technologies/',
+            'http/exposures/apis/',
+            'http/exposures/panels/',
+            'http/exposures/configs/',
         ],
         'scan_ssl': True
     },
@@ -98,10 +100,10 @@ SERVICE_CATEGORIES = {
         'ports': [8000, 8080, 8443, 3000, 5000, 9000],
         'services': ['api', 'rest', 'graphql', 'soap'],
         'templates': [
-            'http/exposures/',         # Exposed API endpoints
-            'http/vulnerabilities/',   # API vulnerabilities
-            'http/misconfiguration/',  # API misconfigurations
-            'http/technologies/',      # API technology detection
+            # API exposures - info disclosure, exposed endpoints
+            'http/technologies/',
+            'http/exposures/apis/',
+            'http/exposures/configs/',
         ],
         'scan_ssl': True
     },
@@ -109,8 +111,8 @@ SERVICE_CATEGORIES = {
         'ports': [5672, 15672, 9092, 2181, 4369, 5671, 61616],
         'services': ['amqp', 'rabbitmq', 'kafka', 'zookeeper', 'activemq', 'mqtt'],
         'templates': [
-            'network/exposures/',      # Exposed messaging services
-            'network/cves/',           # Messaging CVEs
+            # Messaging service exposures - detection only
+            'network/detection/',
         ],
         'network_protocol': True
     }
@@ -450,9 +452,126 @@ class NmapNucleiScanner:
         logger.info(f"\n✓ Built {len(target_files)} target lists\n")
         return target_files
     
+    def fingerprint_technologies(self, category: str, target_file: Path, out_dir: Path) -> List[str]:
+        """Phase 1: Fingerprint technologies to identify what's running"""
+        logger.info(f"  🔍 Phase 1: Fingerprinting {category} services...")
+        
+        # Check if target file has valid targets
+        if not target_file.exists() or target_file.stat().st_size == 0:
+            logger.info(f"    ℹ No targets in file, skipping fingerprinting")
+            return []
+        
+        # Run technology detection templates only
+        fingerprint_file = out_dir / 'fingerprint_results.json'
+        fingerprint_log = out_dir / 'fingerprint.log'
+        
+        cmd = [
+            'nuclei',
+            '-l', str(target_file),
+            '-jsonl',
+            '-o', str(fingerprint_file),
+            '-t', 'http/technologies/',  # Technology detection templates
+            '-duc',
+            '-ni',
+            '-silent',  # Silent for fingerprinting phase
+            '-timeout', '3',  # Ultra-fast timeout for fingerprinting
+            '-retries', '0',  # No retries for fingerprinting
+            '-rate-limit', '300',  # Higher rate limit for speed
+            '-concurrency', '75',  # More concurrent requests
+        ]
+        
+        # Run fingerprinting with timeout
+        try:
+            with open(fingerprint_log, 'w') as log:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                
+                try:
+                    for line in process.stdout:
+                        log.write(line)
+                    
+                    process.wait(timeout=60)  # 60 second timeout for fingerprinting
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    logger.warning(f"    ⚠ Fingerprinting timed out, continuing anyway")
+                    return []
+        except KeyboardInterrupt:
+            logger.warning(f"    ⚠ Fingerprinting interrupted by user")
+            if process:
+                process.kill()
+            raise
+        
+        # Parse detected technologies
+        detected_technologies = set()
+        if fingerprint_file.exists():
+            with open(fingerprint_file, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        template_id = data.get('template-id', '').lower()
+                        info = data.get('info', {})
+                        tags = info.get('tags', [])
+                        
+                        # Extract technology from template ID or tags
+                        if isinstance(tags, list):
+                            detected_technologies.update([tag.lower() for tag in tags])
+                        
+                        # Also extract from template name
+                        tech_name = template_id.replace('http/technologies/', '').replace('-detect', '').replace('-version', '')
+                        if tech_name:
+                            detected_technologies.add(tech_name)
+                            
+                    except json.JSONDecodeError:
+                        continue
+        
+        detected_list = list(detected_technologies)
+        if detected_list:
+            logger.info(f"    ✓ Detected: {', '.join(detected_list[:10])}")
+        else:
+            logger.info(f"    ℹ No specific technologies detected, using general templates")
+        
+        return detected_list
+    
     def scan_category(self, category: str, target_file: Path, out_dir: Path):
         """Run Nuclei scan for a specific service category"""
         logger.info(f"Scanning {category} services...")
+        
+        # Check if target file has valid targets
+        if not target_file.exists() or target_file.stat().st_size == 0:
+            logger.info(f"  ℹ No valid targets for {category}, skipping scan")
+            return 0
+        
+        # Count number of targets
+        with open(target_file, 'r') as f:
+            target_count = len([line for line in f if line.strip()])
+        
+        if target_count == 0:
+            logger.info(f"  ℹ No valid targets for {category}, skipping scan")
+            return 0
+        
+        # Phase 1: Fingerprint technologies (for web-based categories)
+        detected_tech = []
+        if (not self.args.skip_fingerprint and 
+            category in ['web', 'api', 'devops'] and 
+            SERVICE_CATEGORIES.get(category, {}).get('scan_ssl')):
+            try:
+                detected_tech = self.fingerprint_technologies(category, target_file, out_dir)
+            except KeyboardInterrupt:
+                logger.warning(f"  ⚠ Scan interrupted by user")
+                raise
+        elif self.args.skip_fingerprint:
+            logger.info(f"  ⚡ Skipping fingerprinting (fast mode)")
+        
+        # Skip Phase 2 label if we skipped Phase 1
+        phase_label = "Phase 2: " if detected_tech or (category in ['web', 'api', 'devops'] and not self.args.skip_fingerprint) else ""
+        
+        # Phase 2: Run targeted scans based on detected technologies
+        logger.info(f"  🎯 {phase_label}Running targeted vulnerability scans...")
         
         # Determine templates to use
         templates = SERVICE_CATEGORIES.get(category, {}).get('templates', ['exposures/'])
@@ -480,12 +599,59 @@ class NmapNucleiScanner:
         templates = category_config.get('templates', [])
         
         if templates:
-            # Use specified templates for this category
+            # Use specified templates for this category (excluding technologies/ since we ran it in Phase 1)
             for template in templates:
-                cmd.extend(['-t', template])
+                if 'technologies' not in template:  # Skip tech detection, we already did it
+                    cmd.extend(['-t', template])
         else:
-            # Fallback to generic exposures
-            cmd.extend(['-t', 'http/exposures/'])
+            # Fallback based on category type
+            if category == 'other':
+                # Use network templates for unknown services
+                cmd.extend(['-t', 'network/exposures/', '-t', 'network/detection/'])
+            else:
+                # Default to HTTP exposures for other categories
+                cmd.extend(['-t', 'http/exposures/'])
+        
+        # Add tag-based filtering if specific technologies were detected
+        if detected_tech:
+            # Filter templates to only those relevant to detected technologies
+            # Use tags for common technologies
+            tech_tags = []
+            for tech in detected_tech:
+                # Map detected tech to nuclei tags
+                if any(x in tech for x in ['wordpress', 'wp']):
+                    tech_tags.append('wordpress')
+                elif any(x in tech for x in ['joomla']):
+                    tech_tags.append('joomla')
+                elif any(x in tech for x in ['drupal']):
+                    tech_tags.append('drupal')
+                elif any(x in tech for x in ['apache', 'httpd']):
+                    tech_tags.append('apache')
+                elif any(x in tech for x in ['nginx']):
+                    tech_tags.append('nginx')
+                elif any(x in tech for x in ['iis', 'microsoft']):
+                    tech_tags.append('iis')
+                elif any(x in tech for x in ['php']):
+                    tech_tags.append('php')
+                elif any(x in tech for x in ['jenkins']):
+                    tech_tags.append('jenkins')
+                elif any(x in tech for x in ['docker']):
+                    tech_tags.append('docker')
+                elif any(x in tech for x in ['kubernetes', 'k8s']):
+                    tech_tags.append('kubernetes')
+                elif any(x in tech for x in ['tomcat']):
+                    tech_tags.append('tomcat')
+                elif any(x in tech for x in ['java']):
+                    tech_tags.append('java')
+                elif any(x in tech for x in ['node', 'express']):
+                    tech_tags.append('node')
+                elif any(x in tech for x in ['python', 'flask', 'django']):
+                    tech_tags.append('python')
+            
+            if tech_tags:
+                # Add tag filtering to focus on detected technologies
+                cmd.extend(['-tags', ','.join(tech_tags)])
+                logger.info(f"    🏷️  Filtering templates by tags: {', '.join(tech_tags)}")
         
         # Add SSL/TLS scanning for categories that need it
         if category_config.get('scan_ssl') and (
@@ -503,60 +669,95 @@ class NmapNucleiScanner:
         
         # Run scan with real-time output
         logger.info(f"  Command: {' '.join(cmd)}")
-        with open(log_file, 'w') as log:
-            # Use Popen to show output in real-time while also logging
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            
-            # Stream output to both console and log file
-            for line in process.stdout:
-                print(line, end='')  # Real-time output to console
-                log.write(line)  # Save to log file
-            
-            process.wait()
-            result = process
+        try:
+            with open(log_file, 'w') as log:
+                # Use Popen to show output in real-time while also logging
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                
+                # Stream output to both console and log file
+                try:
+                    for line in process.stdout:
+                        print(line, end='')  # Real-time output to console
+                        log.write(line)  # Save to log file
+                    
+                    process.wait()
+                    result = process
+                except KeyboardInterrupt:
+                    logger.warning(f"\n  ⚠ Scan interrupted by user, cleaning up...")
+                    process.kill()
+                    process.wait()
+                    raise
+        except KeyboardInterrupt:
+            raise
         
         if result.returncode != 0:
             logger.warning(f"Nuclei scan for {category} exited with code {result.returncode}")
         
-        # Parse results and create human-readable output
+        # Combine fingerprint and vulnerability findings
         findings_count = 0
+        all_findings = []
+        
+        # Include fingerprint results
+        fingerprint_file = out_dir / 'fingerprint_results.json'
+        if fingerprint_file.exists():
+            with open(fingerprint_file, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        all_findings.append(data)
+                        findings_count += 1
+                    except json.JSONDecodeError:
+                        continue
+        
+        # Include vulnerability scan results
         if output_file.exists():
+            with open(output_file, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        all_findings.append(data)
+                        findings_count += 1
+                    except json.JSONDecodeError:
+                        continue
+        
+        # Create human-readable output from all findings
+        if all_findings:
             readable_file = out_dir / 'findings.txt'
             with open(readable_file, 'w') as out:
                 out.write(f"Nuclei Scan Results - {category.upper()}\n")
                 out.write("=" * 80 + "\n\n")
+                out.write(f"Phase 1: Technology Fingerprinting\n")
+                out.write(f"Phase 2: Targeted Vulnerability Scanning\n")
+                out.write("=" * 80 + "\n\n")
                 
-                with open(output_file, 'r') as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line.strip())
-                            findings_count += 1
-                            
-                            out.write(f"\n{'=' * 80}\n")
-                            out.write(f"Finding #{findings_count}\n")
-                            out.write(f"{'=' * 80}\n")
-                            out.write(f"Template: {data.get('template-id', 'unknown')}\n")
-                            out.write(f"Name: {data.get('info', {}).get('name', 'unknown')}\n")
-                            out.write(f"Severity: {data.get('info', {}).get('severity', 'unknown').upper()}\n")
-                            out.write(f"Target: {data.get('matched-at', data.get('host', 'unknown'))}\n")
-                            
-                            if 'extracted-results' in data:
-                                out.write(f"Extracted: {data['extracted-results']}\n")
-                            
-                            if 'matcher-name' in data:
-                                out.write(f"Matcher: {data['matcher-name']}\n")
-                            
-                            if 'description' in data.get('info', {}):
-                                out.write(f"Description: {data['info']['description']}\n")
-                            
-                        except json.JSONDecodeError:
-                            continue
+                for idx, data in enumerate(all_findings, 1):
+                    out.write(f"\n{'=' * 80}\n")
+                    out.write(f"Finding #{idx}\n")
+                    out.write(f"{'=' * 80}\n")
+                    out.write(f"Template: {data.get('template-id', 'unknown')}\n")
+                    out.write(f"Name: {data.get('info', {}).get('name', 'unknown')}\n")
+                    out.write(f"Severity: {data.get('info', {}).get('severity', 'unknown').upper()}\n")
+                    out.write(f"Target: {data.get('matched-at', data.get('host', 'unknown'))}\n")
+                    
+                    # Show tags if present
+                    tags = data.get('info', {}).get('tags', [])
+                    if tags:
+                        out.write(f"Tags: {', '.join(tags) if isinstance(tags, list) else tags}\n")
+                    
+                    if 'extracted-results' in data:
+                        out.write(f"Extracted: {data['extracted-results']}\n")
+                    
+                    if 'matcher-name' in data:
+                        out.write(f"Matcher: {data['matcher-name']}\n")
+                    
+                    if 'description' in data.get('info', {}):
+                        out.write(f"Description: {data['info']['description']}\n")
         
         logger.info(f"  ✓ {category}: {findings_count} findings")
         return findings_count
@@ -590,7 +791,7 @@ class NmapNucleiScanner:
         # Then run category-based scans
         logger.info("\n📊 Running category-based scans...")
         for category, target_file in target_files.items():
-            out_dir = category_dir_map.get(category, self.dirs['09_other'])
+            out_dir = category_dir_map.get(category, self.dirs['11_other'])
             count = self.scan_category(category, target_file, out_dir)
             total_findings[category] = count
         
@@ -649,7 +850,7 @@ class NmapNucleiScanner:
                     cmd.extend(['-tags', config['tags']])
             
             if not self.args.silent:
-                cmd.append('-v')
+                cmd.append('-stats')  # Show progress statistics instead of verbose
             else:
                 cmd.append('-silent')
             
@@ -799,37 +1000,45 @@ class NmapNucleiScanner:
         """Execute the full Nmap -> Nuclei workflow"""
         start_time = time.time()
         
-        logger.info("=" * 60)
-        logger.info("Nmap-Nuclei Service Vulnerability Scanner")
-        logger.info("=" * 60)
-        logger.info("")
-        
-        # Check prerequisites
-        self.check_requirements()
-        
-        # Stage 0: Parse Nmap results
-        self.load_nmap_results()
-        
-        if not self.all_services:
-            logger.error("No services found in Nmap results!")
-            sys.exit(1)
-        
-        # Stage 1: Build target lists
-        target_files = self.build_target_lists()
-        
-        if not target_files:
-            logger.error("No targets to scan!")
-            sys.exit(1)
-        
-        # Stage 2: Run Nuclei scans
-        findings = self.run_all_scans(target_files)
-        
-        # Stage 3: Generate summary
-        self.generate_summary(findings)
-        
-        elapsed = time.time() - start_time
-        logger.info(f"\n✓ Total scan time: {elapsed/60:.1f} minutes")
-        logger.info(f"✓ Output directory: {self.output_dir}")
+        try:
+            logger.info("=" * 60)
+            logger.info("Nmap-Nuclei Service Vulnerability Scanner")
+            logger.info("=" * 60)
+            logger.info("")
+            
+            # Check prerequisites
+            self.check_requirements()
+            
+            # Stage 0: Parse Nmap results
+            self.load_nmap_results()
+            
+            if not self.all_services:
+                logger.error("No services found in Nmap results!")
+                sys.exit(1)
+            
+            # Stage 1: Build target lists
+            target_files = self.build_target_lists()
+            
+            if not target_files:
+                logger.error("No targets to scan!")
+                sys.exit(1)
+            
+            # Stage 2: Run Nuclei scans
+            findings = self.run_all_scans(target_files)
+            
+            # Stage 3: Generate summary
+            self.generate_summary(findings)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"\n✓ Total scan time: {elapsed/60:.1f} minutes")
+            logger.info(f"✓ Output directory: {self.output_dir}")
+            
+        except KeyboardInterrupt:
+            logger.warning("\n\n⚠️  Scan interrupted by user (Ctrl+C)")
+            logger.info("Partial results may be available in output directories")
+            elapsed = time.time() - start_time
+            logger.info(f"Scan duration before interruption: {elapsed/60:.1f} minutes")
+            sys.exit(130)  # Standard exit code for Ctrl+C
 
 
 def main():
@@ -870,20 +1079,39 @@ Output Structure (within nmap directory):
                        help='Severity levels to scan (default: medium,high,critical)')
     
     # Performance tuning
-    parser.add_argument('-c', '--concurrency', type=int, default=25,
-                       help='Concurrent templates per scan (default: 25)')
-    parser.add_argument('-rl', '--rate-limit', type=int, default=150,
-                       help='Max requests per second (default: 150)')
-    parser.add_argument('--timeout', type=int, default=10,
-                       help='Request timeout in seconds (default: 10)')
-    parser.add_argument('--retries', type=int, default=1,
-                       help='Number of retries (default: 1)')
+    parser.add_argument('-c', '--concurrency', type=int, default=75,
+                       help='Concurrent templates per scan (default: 75)')
+    parser.add_argument('-rl', '--rate-limit', type=int, default=300,
+                       help='Max requests per second (default: 300)')
+    parser.add_argument('--timeout', type=int, default=3,
+                       help='Request timeout in seconds (default: 3)')
+    parser.add_argument('--retries', type=int, default=0,
+                       help='Number of retries (default: 0)')
+    
+    # Speed optimizations
+    parser.add_argument('--skip-fingerprint', action='store_true',
+                       help='Skip technology fingerprinting for faster scans')
+    parser.add_argument('--fast', action='store_true',
+                       help='Ultra-fast mode: max speed settings (500 req/s, 100 concurrency, 2s timeout)')
     
     # Output control
     parser.add_argument('--silent', action='store_true',
                        help='Silent mode (no progress output, only results)')
     
     args = parser.parse_args()
+    
+    # Handle 'all' severity - convert to all severity levels or omit flag
+    if args.severity.lower() == 'all':
+        args.severity = 'info,low,medium,high,critical'
+    
+    # Apply fast mode presets
+    if args.fast:
+        logger.info("⚡ Fast mode enabled - optimizing for speed")
+        args.rate_limit = 500
+        args.concurrency = 100
+        args.timeout = 2
+        args.retries = 0
+        args.skip_fingerprint = True
     
     # Validate nmap output exists
     if not os.path.exists(args.nmap_output):
