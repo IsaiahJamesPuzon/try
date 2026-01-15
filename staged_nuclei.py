@@ -58,7 +58,7 @@ KNOWN_SERVICES = {
 }
 
 # Web service ports (require tech detection first)
-WEB_PORTS = {80, 443, 8000, 8080, 8081, 8083, 8090, 8443, 8888, 3000, 4343, 5000, 7000, 9000}
+WEB_PORTS = {80, 443, 3000, 4380, 5000, 5601, 7000, 8000, 8080, 8081, 8082, 8083, 8090, 8443, 8888, 9000, 9200, 9443, 10443}
 
 # Technology-to-workflow/template mapping
 TECH_WORKFLOWS = {
@@ -285,7 +285,7 @@ class NucleiScanner:
     def run_nuclei(self, target: str, scan_type: str, templates: str = None, 
                    tags: str = None, workflow: str = None) -> List[Dict]:
         """Execute nuclei scan and return findings"""
-        cmd = ['nuclei', '-u', target, '-jsonl', '-silent', '-duc', '-ni']
+        cmd = ['nuclei', '-u', target, '-jsonl', '-v', '-ni', '-duc']
         
         if workflow:
             cmd.extend(['-w', workflow])
