@@ -3,11 +3,16 @@
 Staged Nuclei Scanner for Nmap Output
 
 A service-aware vulnerability scanner that seamlessly continues from staged_nmap.py:
-1. Parses Nmap scan results (XML from 03_enum/)
-2. Categorizes services (web, database, network, iot, devops)
-3. Builds appropriate targets per service type
-4. Runs targeted Nuclei scans based on detected services
+1. Parses Nmap scan results (open_ports_summary.txt or XML from 03_enum/)
+2. For each service, runs technology detection (tech-detect.yaml)
+3. If technology detected, runs targeted tag-based scans
+4. Ingests findings to database using ctem-ingester
 5. Segregates results by service category within the same output directory
+
+Workflow per target:
+- Known services (MongoDB, MySQL, etc.) -> Direct tag-based scan
+- Web/Unknown services -> tech-detect.yaml -> tag-based scan
+- All findings -> database ingestion
 
 Results are placed in the nmap output directory (04_db/, 05_network/, 06_web/, etc.)
 """
@@ -38,17 +43,17 @@ logger = logging.getLogger(__name__)
 # Optimized to use specific template directories from https://github.com/projectdiscovery/nuclei-templates
 SERVICE_CATEGORIES = {
     'web': {
-        'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 4443, 5000, 7001, 8008, 8009, 9000, 9090, 9443],
+        'ports': [80, 81, 443, 8000, 8002, 8080, 8081, 8443, 8888, 3000, 4343, 4443, 5000, 7001, 8008, 8009, 9000, 9090, 9443],
         'services': ['http', 'https', 'http-proxy', 'ssl/http', 'http-alt', 'http-rpc-epmap'],
         'templates': [
-            # PASSIVE RECONNAISSANCE ONLY - No exploits, just discovery
-            'http/technologies/',  # Technology fingerprinting
-            'http/exposures/apis/',  # Exposed API docs, swagger, etc.
-            'http/exposures/configs/',  # Config files, .env, etc.
-            'http/exposures/files/',  # Sensitive files
-            'http/exposures/logs/',  # Log files
-            'http/exposures/backups/',  # Backup files
-            'http/exposures/panels/',  # Admin panels, dashboards
+            # DETECTION & EXPOSURE IDENTIFICATION ONLY
+            'http/exposed-panels/',      # ✅ Detect exposed admin panels (MikroTik, Aruba, etc.)
+            'http/technologies/',        # ✅ Fingerprint technology stack
+            'http/exposures/apis/',      # ✅ Exposed API documentation
+            'http/exposures/configs/',   # ✅ Exposed configuration files
+            'http/exposures/files/',     # ✅ Sensitive files accessible
+            'http/exposures/logs/',      # ✅ Log files exposed
+            'http/exposures/backups/',   # ✅ Backup files exposed
         ],
         'scan_ssl': True  # Also scan for SSL/TLS issues on HTTPS
     },
@@ -57,8 +62,10 @@ SERVICE_CATEGORIES = {
         'services': ['mysql', 'postgresql', 'ms-sql', 'mssql', 'oracle', 'mongodb', 
                     'redis', 'cassandra', 'couchdb', 'elasticsearch', 'memcached', 'db2'],
         'templates': [
-            # Detection only - check if databases are exposed/unauth
-            'network/detection/',
+            # Detection and unauthorized access checks for exposed databases
+            'network/detection/',           # ✅ Detect database services (MongoDB, Redis, MySQL, etc.)
+            'network/misconfig/',          # ✅ Check for misconfigurations (unauth MongoDB, Redis, etc.)
+            'network/enumeration/',        # ✅ Enumerate database information if accessible
         ],
         'network_protocol': True  # Use network protocol scanning
     },
@@ -88,11 +95,11 @@ SERVICE_CATEGORIES = {
         'ports': [2375, 2376, 6443, 8443, 9418, 50000, 9000, 4040],
         'services': ['docker', 'kubernetes', 'k8s', 'git', 'jenkins', 'gitlab', 'rancher'],
         'templates': [
-            # DevOps exposures only - dashboards, consoles, APIs
-            'http/technologies/',
-            'http/exposures/apis/',
-            'http/exposures/panels/',
-            'http/exposures/configs/',
+            # DevOps exposures - dashboards, consoles, APIs
+            'http/exposed-panels/',      # ✅ Exposed DevOps panels
+            'http/technologies/',        # ✅ Technology detection
+            'http/exposures/apis/',      # ✅ Exposed APIs (Docker, K8s)
+            'http/exposures/configs/',   # ✅ Config exposures
         ],
         'scan_ssl': True
     },
@@ -100,10 +107,10 @@ SERVICE_CATEGORIES = {
         'ports': [8000, 8080, 8443, 3000, 5000, 9000],
         'services': ['api', 'rest', 'graphql', 'soap'],
         'templates': [
-            # API exposures - info disclosure, exposed endpoints
-            'http/technologies/',
-            'http/exposures/apis/',
-            'http/exposures/configs/',
+            # API exposures - documentation, endpoints
+            'http/technologies/',        # ✅ API framework detection
+            'http/exposures/apis/',      # ✅ Swagger, OpenAPI, GraphQL endpoints
+            'http/exposures/configs/',   # ✅ Config exposures
         ],
         'scan_ssl': True
     },
@@ -117,6 +124,29 @@ SERVICE_CATEGORIES = {
         'network_protocol': True
     }
 }
+
+# Port-to-service mapping for direct tag-based scanning
+PORT_TO_SERVICE_TAG = {
+    445: 'smb',
+    548: 'smb',
+    22: 'ssh',
+    3389: 'rdp',
+    5900: 'vnc',
+    3306: 'mysql',
+    5432: 'postgres',
+    27017: 'mongodb',
+    6379: 'redis',
+    2181: 'zookeeper',
+    6443: 'kubernetes',
+    2375: 'docker',
+    2376: 'docker',
+    11434: 'ollama',
+    9418: 'git',
+    1099: 'jmx',
+}
+
+# Ports that should run tech-detect first (web services and development tools)
+WEB_PORTS = [80, 443, 8000, 8080, 8090, 8443, 8888, 3000, 9000, 50000, 9222, 6000, 63342, 5037, 5555, 5559]
 
 # Technology-specific Nuclei templates and workflows
 # Maps detected products/services to specific templates or workflows
@@ -190,6 +220,9 @@ class NmapNucleiScanner:
         self.all_services = []  # all discovered services
         self.tech_specific_targets = defaultdict(list)  # technology -> list of targets
         
+        # Workflow mode (set during check_requirements)
+        self.use_summary = False
+        
         # Create output structure by service category within same directory
         self.dirs = {
             'base': self.output_dir,
@@ -218,11 +251,19 @@ class NmapNucleiScanner:
             logger.error(f"Nmap output directory not found: {self.nmap_dir}")
             sys.exit(1)
         
-        # Check for expected nmap output files
+        # Check for open_ports_summary.txt (preferred, from staged_nmap.py)
+        summary_file = self.nmap_dir / 'open_ports_summary.txt'
         enum_dir = self.nmap_dir / '03_enum'
-        if not enum_dir.exists():
-            logger.error(f"Nmap enumeration directory not found: {enum_dir}")
-            logger.error("Expected directory structure from staged_nmap.py output")
+        
+        if summary_file.exists():
+            logger.info(f"Found open_ports_summary.txt - using streamlined workflow")
+            self.use_summary = True
+        elif enum_dir.exists() or list(self.nmap_dir.glob('*.xml')):
+            logger.info(f"Using XML files for service detection")
+            self.use_summary = False
+        else:
+            logger.error(f"No Nmap results found in: {self.nmap_dir}")
+            logger.error("Expected open_ports_summary.txt or XML files")
             sys.exit(1)
         
         # Verify nuclei templates are available
@@ -230,6 +271,51 @@ class NmapNucleiScanner:
         result = subprocess.run(['nuclei', '-tl', '-duc'], capture_output=True, text=True)
         if result.returncode != 0:
             logger.warning("Unable to verify templates, but continuing...")
+    
+    def parse_open_ports_summary(self, summary_file: Path) -> List[Dict]:
+        """
+        Parse open_ports_summary.txt from staged_nmap.py
+        Format: IP PORT1,PORT2,PORT3
+        Example: 10.0.0.1 22,80,443
+        """
+        services = []
+        
+        try:
+            with open(summary_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    
+                    ip = parts[0]
+                    ports = parts[1].split(',')
+                    
+                    for port_str in ports:
+                        try:
+                            port = int(port_str.strip())
+                            service_dict = {
+                                'ip': ip,
+                                'port': port,
+                                'protocol': 'tcp',
+                                'service': 'unknown',
+                                'product': '',
+                                'version': '',
+                                'tunnel': ''
+                            }
+                            services.append(service_dict)
+                        except ValueError:
+                            logger.warning(f"Invalid port number: {port_str} for {ip}")
+                            continue
+        
+        except Exception as e:
+            logger.error(f"Failed to parse {summary_file}: {e}")
+            sys.exit(1)
+        
+        return services
     
     def parse_nmap_xml(self, xml_path: Path) -> List[Dict]:
         """Parse an Nmap XML file and extract service information"""
@@ -269,7 +355,7 @@ class NmapNucleiScanner:
                     version = service_elem.get('version', '') if service_elem is not None else ''
                     tunnel = service_elem.get('tunnel', '') if service_elem is not None else ''
                     
-                    services.append({
+                    service_dict = {
                         'ip': ip,
                         'port': port_id,
                         'protocol': protocol,
@@ -277,7 +363,11 @@ class NmapNucleiScanner:
                         'product': product,
                         'version': version,
                         'tunnel': tunnel
-                    })
+                    }
+                    
+                    # Note: Product detection happens in detect_technology() method
+                    
+                    services.append(service_dict)
         
         except ET.ParseError as e:
             logger.warning(f"Failed to parse {xml_path}: {e}")
@@ -304,32 +394,48 @@ class NmapNucleiScanner:
         service_name = service.get('service', '').lower()
         version = service.get('version', '').lower()
         
-        # Check if product/service matches known technologies
+        # Priority 1: Check Nmap product detection (most accurate)
+        matched_products = []
+        for product_key in ['mikrotik', 'routeros', 'aruba', 'hp', 'cisco', 'juniper', 'fortinet', 
+                           'palo alto', 'apache', 'nginx', 'iis', 'tomcat', 'weblogic', 'mini_httpd',
+                           'wordpress', 'joomla', 'drupal', 'jenkins', 'gitlab', 'docker', 'kubernetes',
+                           'mysql', 'postgresql', 'mongodb', 'redis', 'elasticsearch', 'rabbitmq', 'kafka']:
+            if product_key in product or product_key in service_name:
+                matched_products.append(product_key)
+                logger.info(f"  🎯 Detected {product_key} on {service['ip']}:{service['port']} (from Nmap)")
+        
+        # Priority 2: Check legacy TECH_SPECIFIC_TEMPLATES for workflows
         for tech, config in TECH_SPECIFIC_TEMPLATES.items():
             if tech in product or tech in service_name or tech in version:
-                # Build appropriate target
-                ip = service['ip']
-                port = service['port']
-                tunnel = service.get('tunnel', '')
-                
-                # Format target based on service type
-                if 'http' in service_name or port in [80, 443, 8000, 8080, 8443, 8888]:
-                    if port == 443 or tunnel == 'ssl' or 'https' in service_name:
-                        target = f"https://{ip}:{port}"
-                    elif port == 80:
-                        target = f"http://{ip}"
-                    else:
-                        target = f"http://{ip}:{port}"
+                if tech not in matched_products:
+                    matched_products.append(tech)
+        
+        # Add matched products to tech_specific_targets for targeted scanning
+        for tech in matched_products:
+            ip = service['ip']
+            port = service['port']
+            tunnel = service.get('tunnel', '')
+            
+            # Format target based on service type
+            if 'http' in service_name or port in [80, 443, 8000, 8080, 8443, 8888]:
+                if port == 443 or tunnel == 'ssl' or 'https' in service_name:
+                    target = f"https://{ip}:{port}"
+                elif port == 80:
+                    target = f"http://{ip}"
                 else:
-                    target = f"{ip}:{port}"
-                
-                self.tech_specific_targets[tech].append({
-                    'target': target,
-                    'config': config,
-                    'service': service
-                })
-                
-                logger.info(f"  ⚡ Detected {tech.upper()} on {target}")
+                    target = f"http://{ip}:{port}"
+            else:
+                target = f"{ip}:{port}"
+            
+            # Get config from TECH_SPECIFIC_TEMPLATES or create basic one
+            config = TECH_SPECIFIC_TEMPLATES.get(tech, {'type': 'template', 'path': 'http/exposures/'})
+            
+            self.tech_specific_targets[tech].append({
+                'target': target,
+                'config': config,
+                'service': service,
+                'product': product  # Store original product string for logging
+            })
     
     def load_nmap_results(self):
         """Parse all Nmap XML results and categorize services"""
@@ -337,15 +443,26 @@ class NmapNucleiScanner:
         logger.info("STAGE 0: Parsing Nmap Results")
         logger.info("=" * 60)
         
-        enum_dir = self.nmap_dir / '03_enum'
-        xml_files = list(enum_dir.glob('*.xml'))
-        
-        logger.info(f"Found {len(xml_files)} Nmap XML files to parse")
-        
-        # Parse all XML files
-        for xml_file in xml_files:
-            services = self.parse_nmap_xml(xml_file)
+        # Check if we should use summary file or XML files
+        summary_file = self.nmap_dir / 'open_ports_summary.txt'
+        if hasattr(self, 'use_summary') and self.use_summary and summary_file.exists():
+            logger.info(f"Parsing open_ports_summary.txt")
+            services = self.parse_open_ports_summary(summary_file)
             self.all_services.extend(services)
+        else:
+            # Find all XML files (try 03_enum first, then root directory)
+            enum_dir = self.nmap_dir / '03_enum'
+            if enum_dir.exists():
+                xml_files = list(enum_dir.glob('*.xml'))
+            else:
+                xml_files = list(self.nmap_dir.glob('*.xml'))
+            
+            logger.info(f"Found {len(xml_files)} Nmap XML files to parse")
+            
+            # Parse all XML files
+            for xml_file in xml_files:
+                services = self.parse_nmap_xml(xml_file)
+                self.all_services.extend(services)
         
         logger.info(f"✓ Discovered {len(self.all_services)} total services")
         
@@ -377,14 +494,24 @@ class NmapNucleiScanner:
                            f"{svc['product']} {svc['version']}\n")
         
         logger.info(f"✓ Service summary: {summary_file}")
+        logger.info("")
         
-        # Report detected technologies
+        # Report detected technologies/products
         if self.tech_specific_targets:
-            logger.info("\n⚡ Detected Technologies (will use targeted templates):")
+            logger.info("\n" + "=" * 80)
+            logger.info("🎯 DETECTED PRODUCTS & TECHNOLOGIES")
+            logger.info("=" * 80)
             for tech in sorted(self.tech_specific_targets.keys()):
                 count = len(self.tech_specific_targets[tech])
                 tech_type = self.tech_specific_targets[tech][0]['config']['type']
-                logger.info(f"  {tech:20} : {count:2} targets ({tech_type})")
+                product_name = self.tech_specific_targets[tech][0].get('product', tech)
+                
+                # Show each target
+                logger.info(f"\n📦 {tech.upper()}")
+                logger.info(f"   Product: {product_name}")
+                logger.info(f"   Targets: {count}")
+                for target_info in self.tech_specific_targets[tech]:
+                    logger.info(f"     • {target_info['target']}")
         logger.info("")
     
     def build_target_lists(self):
@@ -452,32 +579,221 @@ class NmapNucleiScanner:
         logger.info(f"\n✓ Built {len(target_files)} target lists\n")
         return target_files
     
+    def run_tech_detect_single(self, target: str, out_dir: Path) -> List[str]:
+        """
+        Run tech-detect.yaml on a single target to identify technology
+        Returns list of detected technology tags
+        """
+        results_file = out_dir / f'tech_detect_{target.replace(":", "_").replace("/", "_")}.json'
+        
+        cmd = [
+            'nuclei',
+            '-u', target,
+            '-jsonl',
+            '-o', str(results_file),
+            '-t', 'http/technologies/tech-detect.yaml',
+            '-duc',
+            '-ni',
+            '-silent',
+            '-timeout', '5',
+            '-retries', '0',
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"    ⚠ Tech detection timed out for {target}")
+            return []
+        
+        # Parse detected technologies
+        detected_tech = set()
+        if results_file.exists() and results_file.stat().st_size > 0:
+            with open(results_file, 'r') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        matcher_name = data.get('matcher-name', '').lower()
+                        if matcher_name and matcher_name != 'unknown':
+                            detected_tech.add(matcher_name)
+                            # Also extract product names from template-id
+                            template_id = data.get('template-id', '')
+                            if 'tech-detect:' in template_id:
+                                tech = template_id.split('tech-detect:')[1].split(']')[0]
+                                detected_tech.add(tech.lower())
+                    except json.JSONDecodeError:
+                        continue
+        
+        return list(detected_tech)
+    
+    def run_tag_based_scan(self, target: str, tags: str, out_dir: Path) -> Path:
+        """
+        Run nuclei with specific tags on a target
+        Returns path to results file
+        """
+        safe_target = target.replace(":", "_").replace("/", "_")
+        safe_tags = tags.replace(",", "_")
+        results_file = out_dir / f'nuclei_{safe_target}_{safe_tags}.json'
+        
+        cmd = [
+            'nuclei',
+            '-u', target,
+            '-jsonl',
+            '-o', str(results_file),
+            '-tags', tags,
+            '-duc',
+            '-ni',
+            '-v',
+            '-timeout', str(self.args.timeout),
+            '-retries', str(self.args.retries),
+            '-severity', self.args.severity,
+        ]
+        
+        logger.info(f"    Running: nuclei -tags {tags} -u {target}")
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.stdout:
+                # Print any findings to console
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        print(f"      {line}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"    ⚠ Scan timed out for {target} with tags {tags}")
+        
+        return results_file
+    
+    def ingest_to_database(self, results_file: Path, office_id: str = None, scanner_id: str = None) -> bool:
+        """
+        Ingest nuclei results to database using ctem-ingester
+        Returns True if successful
+        """
+        # Check if ingestion is disabled
+        if hasattr(self.args, 'no_ingest') and self.args.no_ingest:
+            return False
+        
+        if not results_file.exists() or results_file.stat().st_size == 0:
+            return False
+        
+        # Find ingester script
+        ingester_script = Path(__file__).parent.parent / 'ctem-ingester' / 'ingestion' / 'ingest.py'
+        if not ingester_script.exists():
+            logger.warning(f"    ⚠ Ingester script not found: {ingester_script}")
+            return False
+        
+        # Use provided IDs or defaults
+        if not office_id:
+            office_id = self.args.office_id if hasattr(self.args, 'office_id') else 'default-office'
+        if not scanner_id:
+            scanner_id = self.args.scanner_id if hasattr(self.args, 'scanner_id') else 'nuclei-scanner'
+        
+        cmd = [
+            'python3',
+            str(ingester_script),
+            str(results_file),
+            f'--office-id={office_id}',
+            f'--scanner-id={scanner_id}',
+            '--scanner-type=nuclei',
+            '--json'
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                try:
+                    ingest_result = json.loads(result.stdout)
+                    if ingest_result.get('status') == 'success':
+                        logger.info(f"      ✓ Ingested: {ingest_result.get('events', 0)} events, "
+                                  f"{ingest_result.get('exposures_new', 0)} new exposures")
+                        return True
+                except json.JSONDecodeError:
+                    pass
+            else:
+                logger.warning(f"    ⚠ Ingestion failed: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"    ⚠ Ingestion timed out")
+        except Exception as e:
+            logger.warning(f"    ⚠ Ingestion error: {e}")
+        
+        return False
+    
+    def scan_target_workflow(self, ip: str, port: int, out_dir: Path):
+        """
+        Two-phase scanning workflow for a single target:
+        1. Tech detection (for web ports) or direct tag scan (for known services)
+        2. Tag-based vulnerability scan
+        3. Database ingestion
+        """
+        # Determine if this is a known service port
+        if port in PORT_TO_SERVICE_TAG:
+            # Direct tag-based scan for known services
+            service_tag = PORT_TO_SERVICE_TAG[port]
+            target = f"{ip}:{port}"
+            
+            logger.info(f"  🎯 Known service on {target} -> {service_tag}")
+            results_file = self.run_tag_based_scan(target, service_tag, out_dir)
+            
+            # Ingest if we got results
+            if results_file.exists() and results_file.stat().st_size > 0:
+                self.ingest_to_database(results_file)
+        
+        elif port in WEB_PORTS:
+            # Two-phase workflow for web services
+            # Determine if HTTP or HTTPS
+            if port == 443 or port == 8443:
+                target = f"https://{ip}:{port}" if port != 443 else f"https://{ip}"
+            elif port == 80:
+                target = f"http://{ip}"
+            else:
+                target = f"http://{ip}:{port}"
+            
+            logger.info(f"  🔍 Web service on {target}")
+            
+            # Phase 1: Technology detection
+            detected_tech = self.run_tech_detect_single(target, out_dir)
+            
+            if detected_tech:
+                logger.info(f"    ✓ Detected: {', '.join(detected_tech[:5])}")
+                
+                # Phase 2: Run tag-based scan for each detected technology
+                for tech in detected_tech[:3]:  # Limit to top 3 to avoid over-scanning
+                    results_file = self.run_tag_based_scan(target, tech, out_dir)
+                    
+                    # Ingest if we got results
+                    if results_file.exists() and results_file.stat().st_size > 0:
+                        self.ingest_to_database(results_file)
+            else:
+                logger.info(f"    ℹ No specific technology detected, running general web scan")
+                # Run general web exposure scan
+                results_file = self.run_tag_based_scan(target, 'exposure', out_dir)
+                if results_file.exists() and results_file.stat().st_size > 0:
+                    self.ingest_to_database(results_file)
+    
     def fingerprint_technologies(self, category: str, target_file: Path, out_dir: Path) -> List[str]:
         """Phase 1: Fingerprint technologies to identify what's running"""
-        logger.info(f"  🔍 Phase 1: Fingerprinting {category} services...")
+        logger.info(f"  🔍 Phase 1: Technology Detection (using tech-detect.yaml)...")
         
         # Check if target file has valid targets
         if not target_file.exists() or target_file.stat().st_size == 0:
             logger.info(f"    ℹ No targets in file, skipping fingerprinting")
             return []
         
-        # Run technology detection templates only
-        fingerprint_file = out_dir / 'fingerprint_results.json'
-        fingerprint_log = out_dir / 'fingerprint.log'
+        # Run comprehensive technology detection first
+        fingerprint_file = out_dir / 'tech_detect_results.json'
+        fingerprint_log = out_dir / 'tech_detect.log'
         
         cmd = [
             'nuclei',
             '-l', str(target_file),
             '-jsonl',
             '-o', str(fingerprint_file),
-            '-t', 'http/technologies/',  # Technology detection templates
+            '-t', 'http/technologies/tech-detect.yaml',  # Comprehensive Wappalyzer-based detection
             '-duc',
             '-ni',
             '-silent',  # Silent for fingerprinting phase
-            '-timeout', '3',  # Ultra-fast timeout for fingerprinting
+            '-timeout', '5',  # Give it time to analyze responses
             '-retries', '0',  # No retries for fingerprinting
-            '-rate-limit', '300',  # Higher rate limit for speed
-            '-concurrency', '75',  # More concurrent requests
+            '-rate-limit', '200',  # Moderate rate limit
+            '-concurrency', '50',  # Moderate concurrency
         ]
         
         # Run fingerprinting with timeout
@@ -506,34 +822,61 @@ class NmapNucleiScanner:
                 process.kill()
             raise
         
-        # Parse detected technologies
+        # Parse detected technologies from tech-detect results
         detected_technologies = set()
+        detected_details = []
+        
         if fingerprint_file.exists():
             with open(fingerprint_file, 'r') as f:
                 for line in f:
                     try:
                         data = json.loads(line.strip())
                         template_id = data.get('template-id', '').lower()
+                        
+                        # tech-detect.yaml uses matcher names to identify technologies
+                        matcher_name = data.get('matcher-name', '').lower()
+                        if matcher_name and matcher_name != 'unknown':
+                            detected_technologies.add(matcher_name)
+                            detected_details.append({
+                                'tech': matcher_name,
+                                'target': data.get('matched-at', data.get('host', 'unknown'))
+                            })
+                        
+                        # Also check extracted results
+                        extracted = data.get('extracted-results', [])
+                        if extracted and isinstance(extracted, list):
+                            for tech in extracted:
+                                if tech:
+                                    detected_technologies.add(tech.lower())
+                        
+                        # Fall back to tags if available
                         info = data.get('info', {})
                         tags = info.get('tags', [])
-                        
-                        # Extract technology from template ID or tags
                         if isinstance(tags, list):
-                            detected_technologies.update([tag.lower() for tag in tags])
-                        
-                        # Also extract from template name
-                        tech_name = template_id.replace('http/technologies/', '').replace('-detect', '').replace('-version', '')
-                        if tech_name:
-                            detected_technologies.add(tech_name)
+                            detected_technologies.update([tag.lower() for tag in tags if tag not in ['tech', 'discovery']])
                             
                     except json.JSONDecodeError:
                         continue
         
         detected_list = list(detected_technologies)
         if detected_list:
-            logger.info(f"    ✓ Detected: {', '.join(detected_list[:10])}")
+            logger.info(f"    ✅ Technologies detected: {', '.join(sorted(detected_list)[:15])}")
+            if len(detected_list) > 15:
+                logger.info(f"       ... and {len(detected_list) - 15} more")
+            
+            # Show details of what was detected on which targets
+            target_summary = {}
+            for detail in detected_details:
+                target = detail['target']
+                tech = detail['tech']
+                if target not in target_summary:
+                    target_summary[target] = []
+                target_summary[target].append(tech)
+            
+            for target, techs in list(target_summary.items())[:3]:  # Show first 3 targets
+                logger.info(f"       {target}: {', '.join(techs[:5])}")
         else:
-            logger.info(f"    ℹ No specific technologies detected, using general templates")
+            logger.info(f"    ℹ No specific technologies detected, will use general templates")
         
         return detected_list
     
@@ -611,6 +954,8 @@ class NmapNucleiScanner:
             else:
                 # Default to HTTP exposures for other categories
                 cmd.extend(['-t', 'http/exposures/'])
+        
+        # Product-specific templates are handled via tech_specific_targets in detect_technology()
         
         # Add tag-based filtering if specific technologies were detected
         if detected_tech:
@@ -761,6 +1106,57 @@ class NmapNucleiScanner:
         
         logger.info(f"  ✓ {category}: {findings_count} findings")
         return findings_count
+    
+    def run_streamlined_workflow(self):
+        """
+        Run streamlined two-phase workflow on all discovered services
+        This is used when parsing from open_ports_summary.txt
+        """
+        logger.info("=" * 60)
+        logger.info("STAGE 2: Running Two-Phase Detection & Scanning Workflow")
+        logger.info("=" * 60)
+        logger.info("Phase 1: Technology Detection (tech-detect.yaml for web services)")
+        logger.info("Phase 2: Targeted Vulnerability Scanning (tag-based)")
+        logger.info("Phase 3: Database Ingestion (ctem-ingester)")
+        logger.info("=" * 60)
+        
+        # Group services by IP for better logging
+        services_by_ip = defaultdict(list)
+        for svc in self.all_services:
+            services_by_ip[svc['ip']].append(svc)
+        
+        # Determine output directory (use base or create workflow dir)
+        workflow_dir = self.output_dir / '12_workflow_scans'
+        workflow_dir.mkdir(parents=True, exist_ok=True)
+        
+        total_scans = 0
+        total_ingestions = 0
+        
+        # Process each IP and its services
+        for ip in sorted(services_by_ip.keys()):
+            services = services_by_ip[ip]
+            logger.info(f"\n📍 Processing {ip} ({len(services)} open ports)")
+            
+            # Create IP-specific directory
+            ip_dir = workflow_dir / ip.replace('.', '_')
+            ip_dir.mkdir(parents=True, exist_ok=True)
+            
+            for svc in services:
+                port = svc['port']
+                try:
+                    self.scan_target_workflow(ip, port, ip_dir)
+                    total_scans += 1
+                except KeyboardInterrupt:
+                    logger.warning("\n  ⚠ Scan interrupted by user")
+                    raise
+                except Exception as e:
+                    logger.warning(f"  ⚠ Error scanning {ip}:{port} - {e}")
+        
+        logger.info(f"\n✓ Streamlined workflow complete")
+        logger.info(f"  Total targets scanned: {total_scans}")
+        logger.info(f"  Results directory: {workflow_dir}")
+        
+        return {'streamlined': total_scans}
     
     def run_all_scans(self, target_files: Dict[str, Path]):
         """Run Nuclei scans for all service categories"""
@@ -1016,18 +1412,27 @@ class NmapNucleiScanner:
                 logger.error("No services found in Nmap results!")
                 sys.exit(1)
             
-            # Stage 1: Build target lists
-            target_files = self.build_target_lists()
-            
-            if not target_files:
-                logger.error("No targets to scan!")
-                sys.exit(1)
-            
-            # Stage 2: Run Nuclei scans
-            findings = self.run_all_scans(target_files)
-            
-            # Stage 3: Generate summary
-            self.generate_summary(findings)
+            # Choose workflow based on input format
+            if hasattr(self, 'use_summary') and self.use_summary:
+                # Streamlined workflow for open_ports_summary.txt
+                logger.info("Using streamlined two-phase workflow (open_ports_summary.txt)")
+                findings = self.run_streamlined_workflow()
+            else:
+                # Traditional workflow for XML files
+                logger.info("Using traditional category-based workflow (XML files)")
+                
+                # Stage 1: Build target lists
+                target_files = self.build_target_lists()
+                
+                if not target_files:
+                    logger.error("No targets to scan!")
+                    sys.exit(1)
+                
+                # Stage 2: Run Nuclei scans
+                findings = self.run_all_scans(target_files)
+                
+                # Stage 3: Generate summary
+                self.generate_summary(findings)
             
             elapsed = time.time() - start_time
             logger.info(f"\n✓ Total scan time: {elapsed/60:.1f} minutes")
@@ -1047,27 +1452,46 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Scan services from nmap output (results go in same directory)
-  python3 staged_nuclei.py -n out_bigscan
+  # Streamlined workflow from open_ports_summary.txt
+  python3 staged_nuclei.py -n nmap_staged_out --office-id office-1 --scanner-id scanner-1
 
-  # High-severity only
-  python3 staged_nuclei.py -n out_bigscan -s high
+  # High-severity only, fast mode
+  python3 staged_nuclei.py -n nmap_staged_out -s high --fast
 
-  # Verbose mode
-  python3 staged_nuclei.py -n out_bigscan -v
+  # Skip database ingestion
+  python3 staged_nuclei.py -n nmap_staged_out --no-ingest
+
+Workflow (when using open_ports_summary.txt):
+  1. For known services (MongoDB, MySQL, Redis, etc.):
+     → Direct tag-based scan (e.g., nuclei -tags mongodb -u 10.0.0.1:27017)
+  
+  2. For web services (80, 443, 8080, etc.):
+     → Phase 1: Technology detection (tech-detect.yaml)
+     → Phase 2: Tag-based scan for detected technologies
+     → Example: http://10.0.0.1:8080 → detects "mikrotik" → nuclei -tags mikrotik
+  
+  3. All findings are ingested to database using ctem-ingester
 
 Expected Input:
   The script expects Nmap output from staged_nmap.py:
-    - <nmap_dir>/03_enum/*.xml (Nmap XML files with service details)
-    - <nmap_dir>/open_ports_summary.txt (optional, for quick reference)
+    - <nmap_dir>/open_ports_summary.txt (PREFERRED - enables streamlined workflow)
+    - <nmap_dir>/03_enum/*.xml (Alternative - traditional category-based workflow)
 
-Output Structure (within nmap directory):
+Output Structure (streamlined workflow):
+  <nmap_dir>/12_workflow_scans/
+    ├── 10_0_0_1/           - Results for 10.0.0.1
+    ├── 10_0_0_2/           - Results for 10.0.0.2
+    └── ...
+
+Output Structure (traditional workflow):
   <nmap_dir>/04_db/       - Database service vulnerabilities
   <nmap_dir>/05_network/  - Network service vulnerabilities
   <nmap_dir>/06_web/      - Web application vulnerabilities
-  <nmap_dir>/07_iot/      - IoT service vulnerabilities
-  <nmap_dir>/08_devops/   - DevOps platform vulnerabilities
-  <nmap_dir>/09_other/    - Other service vulnerabilities
+  <nmap_dir>/07_api/      - API service vulnerabilities
+  <nmap_dir>/08_iot/      - IoT service vulnerabilities
+  <nmap_dir>/09_devops/   - DevOps platform vulnerabilities
+  <nmap_dir>/10_messaging/ - Messaging service vulnerabilities
+  <nmap_dir>/11_other/    - Other service vulnerabilities
         """
     )
     
@@ -1097,6 +1521,14 @@ Output Structure (within nmap directory):
     # Output control
     parser.add_argument('--silent', action='store_true',
                        help='Silent mode (no progress output, only results)')
+    
+    # Database ingestion
+    parser.add_argument('--office-id', default='default-office',
+                       help='Office ID for database ingestion (default: default-office)')
+    parser.add_argument('--scanner-id', default='nuclei-scanner',
+                       help='Scanner ID for database ingestion (default: nuclei-scanner)')
+    parser.add_argument('--no-ingest', action='store_true',
+                       help='Skip database ingestion step')
     
     args = parser.parse_args()
     
